@@ -42,7 +42,9 @@ setInterval(() => {
 
 async function startServer() {
   const app = express();
-  const PORT = process.env.PORT || 3000; // Render uses dynamic ports
+  
+  // Fixed: Force PORT to be a strict number for TypeScript compliance on Render
+  const PORT: number = parseInt(process.env.PORT || '3000', 10);
 
   app.use(express.json());
 
