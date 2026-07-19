@@ -5,7 +5,6 @@
 
 import express from 'express';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 
 interface RoomPlayer {
   id: string;
@@ -43,9 +42,7 @@ setInterval(() => {
 
 async function startServer() {
   const app = express();
-  
-  // Fixed: Converted PORT to a proper number to fix TypeScript Error TS2769
-  const PORT = parseInt(process.env.PORT || '3000', 10);
+  const PORT = process.env.PORT || 3000; // Render uses dynamic ports
 
   app.use(express.json());
 
@@ -313,22 +310,17 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  // --- VITE MIDDLEWARE & STATIC SERVING ---
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    
-    // Middleware to prevent Express Path Errors on Render
-    app.use((req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
+  // --- STATIC SERVING FOR PRODUCTION ---
+  const distPath = path.join(process.cwd(), 'dist');
+  app.use(express.static(distPath));
+  
+  // Fallback for SPA routing (will serve index.html for non-API routes)
+  app.use((req, res, next) => {
+    if (req.path.startsWith('/api')) {
+      return next(); // Allow API calls to bypass static fallback
+    }
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Ludo Server] Express custom server running on Port ${PORT}`);
