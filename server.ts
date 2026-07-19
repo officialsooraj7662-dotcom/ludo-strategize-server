@@ -43,7 +43,7 @@ setInterval(() => {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT || 3000; // Render uses dynamic ports
 
   app.use(express.json());
 
@@ -321,13 +321,15 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
+    
+    // Fixed: Replaced app.get('*') with a middleware to prevent Express Path Errors on Render
     app.use((req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Ludo Server] Express custom server running on http://0.0.0.0:${PORT}`);
+    console.log(`[Ludo Server] Express custom server running on Port ${PORT}`);
   });
 }
 
