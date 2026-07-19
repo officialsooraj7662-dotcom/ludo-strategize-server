@@ -43,7 +43,9 @@ setInterval(() => {
 
 async function startServer() {
   const app = express();
-  const PORT = process.env.PORT || 3000; // Render uses dynamic ports
+  
+  // Fixed: Converted PORT to a proper number to fix TypeScript Error TS2769
+  const PORT = parseInt(process.env.PORT || '3000', 10);
 
   app.use(express.json());
 
@@ -322,7 +324,7 @@ async function startServer() {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     
-    // Fixed: Replaced app.get('*') with a middleware to prevent Express Path Errors on Render
+    // Middleware to prevent Express Path Errors on Render
     app.use((req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
