@@ -34,12 +34,14 @@ const activeRooms: Record<string, Room> = {};
 // Clean up idle rooms older than 2 hours periodically
 setInterval(() => {
   const now = Date.now();
+  const maxIdleTime = 2 * 60 * 60 * 1000; // 2 hours
   Object.keys(activeRooms).forEach((code) => {
-    if (now - activeRooms[code].updatedAt > 2 * 60 * 60 * 1000) {
+    if (now - activeRooms[code].updatedAt > maxIdleTime) {
+      console.log(`[Ludo Server] Cleaning up idle room: ${code}`);
       delete activeRooms[code];
     }
   });
-}, 30 * 60 * 1000);
+}, 15 * 60 * 1000); // Every 15 minutes
 
 async function startServer() {
   const app = express();
@@ -238,49 +240,30 @@ async function startServer() {
 
     room.version++;
     room.updatedAt = Date.now();
-    console.log(`[Ludo Server] Room ${code} players rotated by host. New version: ${room.version}`);
+    console.log(`[Ludo Server] Rotated colors in room ${code}`);
     res.json(room);
   });
 
-  // Get room state (polling fallback with version-based fast polling)
-  app.get('/api/rooms/:code', (req, res) => {
-    const code = req.params.code.toUpperCase();
-    const room = activeRooms[code];
-    if (!room) {
-      return res.status(404).json({ error: 'Room not found' });
-    }
-
-    // Check client version
-    const clientVersion = req.query.v ? parseInt(req.query.v as string, 10) : undefined;
-    if (clientVersion !== undefined && room.version === clientVersion) {
-      return res.json({ changed: false, version: room.version });
-    }
-
-    res.json({
-      changed: true,
-      ...room
-    });
-  });
-
-  // Update room gameState
+  // Synchronize entire board state
   app.post('/api/rooms/:code/update', (req, res) => {
-    const code = req.params.code.toUpperCase();
-    const { gameState } = req.body;
+    const code = req.params.code.toUpperCase().trim();
+    const { gameState, version } = req.body;
     const room = activeRooms[code];
 
     if (!room) {
       return res.status(404).json({ error: 'Room not found' });
     }
 
+    // Handle board state replication
     room.gameState = gameState;
-    room.version++;
+    room.version = version ?? (room.version + 1);
     room.updatedAt = Date.now();
     res.json({ success: true, version: room.version });
   });
 
-  // Toggle room teamUp mode
+  // Change Team Up Mode
   app.post('/api/rooms/:code/teamup', (req, res) => {
-    const code = req.params.code.toUpperCase();
+    const code = req.params.code.toUpperCase().trim();
     const { isTeamUpMode } = req.body;
     const room = activeRooms[code];
 
@@ -291,12 +274,25 @@ async function startServer() {
     room.isTeamUpMode = !!isTeamUpMode;
     room.version++;
     room.updatedAt = Date.now();
-    res.json({ success: true, version: room.version, isTeamUpMode: room.isTeamUpMode });
+    console.log(`[Ludo Server] Team up mode changed to ${isTeamUpMode} for room ${code}`);
+    res.json(room);
   });
 
-  // WebRTC signaling exchange
+  // Retrieve room state
+  app.get('/api/rooms/:code', (req, res) => {
+    const code = req.params.code.toUpperCase().trim();
+    const room = activeRooms[code];
+
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    res.json(room);
+  });
+
+  // Send signaling messages (WebRTC fallback)
   app.post('/api/rooms/:code/signaling', (req, res) => {
-    const code = req.params.code.toUpperCase();
+    const code = req.params.code.toUpperCase().trim();
     const { from, type, payload } = req.body;
     const room = activeRooms[code];
 
@@ -304,20 +300,14 @@ async function startServer() {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    // Push new signaling message
     room.signalingData.push({ from, type, payload });
-    // Keep only last 20 signaling messages to save memory
-    if (room.signalingData.length > 20) {
-      room.signalingData.shift();
-    }
-
     room.updatedAt = Date.now();
     res.json({ success: true });
   });
 
-  // Clear signaling (once connected)
+  // Clear signaling messages
   app.post('/api/rooms/:code/signaling/clear', (req, res) => {
-    const code = req.params.code.toUpperCase();
+    const code = req.params.code.toUpperCase().trim();
     const room = activeRooms[code];
     if (room) {
       room.signalingData = [];
