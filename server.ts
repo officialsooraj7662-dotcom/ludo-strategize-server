@@ -5,6 +5,7 @@
 
 import express from 'express';
 import path from 'path';
+import { createServer as createViteServer } from 'vite';
 
 interface RoomPlayer {
   id: string;
@@ -42,9 +43,21 @@ setInterval(() => {
 
 async function startServer() {
   const app = express();
-  
-  // Fixed: Force PORT to be a strict number for TypeScript compliance on Render
-  const PORT: number = parseInt(process.env.PORT || '3000', 10);
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+
+  // --- CORS MIDDLEWARE (Required for Render and external app connections) ---
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, PATCH, DELETE');
+    res.setHeader('Access-Control-Allow-Headers', 'X-Requested-With,content-type,Authorization');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    
+    // Handle OPTIONS preflight requests
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+    next();
+  });
 
   app.use(express.json());
 
@@ -312,20 +325,23 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  // --- STATIC SERVING FOR PRODUCTION ---
-  const distPath = path.join(process.cwd(), 'dist');
-  app.use(express.static(distPath));
-  
-  // Fallback for SPA routing (will serve index.html for non-API routes)
-  app.use((req, res, next) => {
-    if (req.path.startsWith('/api')) {
-      return next(); // Allow API calls to bypass static fallback
-    }
-    res.sendFile(path.join(distPath, 'index.html'));
-  });
+  // --- VITE MIDDLEWARE & STATIC SERVING ---
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Ludo Server] Express custom server running on Port ${PORT}`);
+    console.log(`[Ludo Server] Express custom server running on http://0.0.0.0:${PORT}`);
   });
 }
 
