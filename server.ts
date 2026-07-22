@@ -3,11 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import * as expressImport from 'express';
-import * as path from 'path';
-import * as fs from 'fs';
-import { createServer as createHttpServer } from 'http';
-import { Server as SocketIOServer } from 'socket.io';
+import express from 'express';
+import path from 'path';
+import fs from 'fs';
 
 interface RoomPlayer {
   id: string;
@@ -19,236 +17,301 @@ interface RoomPlayer {
 
 interface Room {
   code: string;
-  creatorId: string;
   players: RoomPlayer[];
-  colorToPlayer: Record<string, string>;
-  gameState: any;
-  lastActivity: number;
+  gameState: any; // Complete board state sync
+  isTeamUpMode?: boolean;
+  signalingData: {
+    from: string;
+    type: string;
+    payload: any;
+  }[];
+  updatedAt: number;
+  version: number;
 }
 
-const rooms: Record<string, Room> = {};
+const activeRooms: Record<string, Room> = {};
 
-function generateRoomCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 6; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return rooms[code] ? generateRoomCode() : code;
-}
-
-// Clean up stale rooms older than 30 minutes
+// Clean up idle rooms older than 2 hours periodically
 setInterval(() => {
   const now = Date.now();
-  for (const code in rooms) {
-    if (now - rooms[code].lastActivity > 30 * 60 * 1000) {
-      delete rooms[code];
-      console.log(`[Ludo Server] Room ${code} cleaned up due to inactivity.`);
+  Object.keys(activeRooms).forEach((code) => {
+    if (now - activeRooms[code].updatedAt > 2 * 60 * 60 * 1000) {
+      delete activeRooms[code];
     }
-  }
+  });
 }, 30 * 60 * 1000);
 
 async function startServer() {
-  const express = (expressImport as any).default || expressImport;
   const app = express();
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
+  // --- CORS MIDDLEWARE (Required for Render and external app connections) ---
+  app.use((req, res, next) => {
+    const origin = req.headers.origin || '*';
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, PATCH, DELETE');
+    res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    
+    // Handle OPTIONS preflight requests
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+    next();
+  });
+
   app.use(express.json());
 
-  const httpServer = createHttpServer(app);
-  const io = new SocketIOServer(httpServer, {
-    cors: {
-      origin: '*',
-      methods: ['GET', 'POST'],
-    },
+  // --- API ENDPOINTS ---
+
+  // Health check
+  app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', activeRoomsCount: Object.keys(activeRooms).length });
   });
 
-  // REST endpoints for health check & quick room creation
-  app.get('/api/health', (req, res) => {
+  // Get latest App Version and upgrade links
+  app.get('/api/app-version', (req, res) => {
     res.json({
-      status: 'ok',
-      activeRooms: Object.keys(rooms).length,
-      timestamp: Date.now(),
+      latestVersion: '2.4',
+      minRequiredVersion: '2.4',
+      playStoreUrl: 'https://play.google.com/store/apps/details?id=com.gamers.ludo',
+      appStoreUrl: 'https://apps.apple.com/app/ludo-battle-king/id1234567890',
     });
   });
 
+  // Create room
   app.post('/api/rooms/create', (req, res) => {
-    const { playerName, appVersion } = req.body;
-    const roomCode = generateRoomCode();
-    const playerId = 'ply-' + Math.random().toString(36).substring(2, 11);
+    const { playerName, playerId, isTeamUpMode, appVersion } = req.body;
+    
+    // Generate a unique 6-digit uppercase alphanumeric room code
+    let code = '';
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    do {
+      code = '';
+      for (let i = 0; i < 6; i++) {
+        code += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+    } while (activeRooms[code]);
 
-    rooms[roomCode] = {
-      code: roomCode,
-      creatorId: playerId,
+    const newRoom: Room = {
+      code,
       players: [
         {
-          id: playerId,
+          id: playerId || 'player-1',
           name: playerName || 'Player 1',
-          color: 'red',
+          color: 'RED',
           isCreator: true,
-          appVersion,
+          appVersion: appVersion || '2.4',
         },
       ],
-      colorToPlayer: { red: playerId },
       gameState: null,
-      lastActivity: Date.now(),
+      isTeamUpMode: !!isTeamUpMode,
+      signalingData: [],
+      updatedAt: Date.now(),
+      version: 0,
     };
 
-    console.log(`[Ludo Server] Room created: ${roomCode} by ${playerName || 'Player 1'}`);
+    activeRooms[code] = newRoom;
+    console.log(`[Ludo Server] Room created: ${code} by ${playerName}`);
+    res.json(newRoom);
+  });
+
+  // Join room
+  app.post('/api/rooms/join', (req, res) => {
+    const { code, playerName, playerId, appVersion } = req.body;
+    const cleanCode = (code || '').toUpperCase().trim();
+    const room = activeRooms[cleanCode];
+
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found. Please verify the code.' });
+    }
+
+    if (room.players.length >= 4) {
+      return res.status(400).json({ error: 'Room is full (maximum 4 players).' });
+    }
+
+    // Check if player already in room
+    const exists = room.players.find((p) => p.id === playerId);
+    if (!exists) {
+      const colors = ['RED', 'YELLOW', 'GREEN', 'BLUE'];
+      const usedColors = room.players.map((p) => p.color);
+      const color = colors.find((c) => !usedColors.includes(c)) || 'YELLOW';
+
+      room.players.push({
+        id: playerId,
+        name: playerName || `Player ${room.players.length + 1}`,
+        color,
+        isCreator: false,
+        appVersion: appVersion || '2.4',
+      });
+      room.version++;
+    } else {
+      if (appVersion) {
+        exists.appVersion = appVersion;
+      }
+    }
+
+    room.updatedAt = Date.now();
+    console.log(`[Ludo Server] Player ${playerName} joined room: ${cleanCode}`);
+    res.json(room);
+  });
+
+  // Leave room
+  app.post('/api/rooms/:code/leave', (req, res) => {
+    const code = req.params.code.toUpperCase().trim();
+    const { playerId } = req.body;
+    const room = activeRooms[code];
+
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    const playerIndex = room.players.findIndex((p) => p.id === playerId);
+    if (playerIndex !== -1) {
+      const wasCreator = room.players[playerIndex].isCreator;
+      room.players.splice(playerIndex, 1);
+
+      if (room.players.length === 0) {
+        delete activeRooms[code];
+        console.log(`[Ludo Server] Room ${code} is empty. Room deleted.`);
+        return res.json({ success: true, roomDeleted: true });
+      } else {
+        if (wasCreator) {
+          room.players[0].isCreator = true;
+          console.log(`[Ludo Server] Host left room ${code}. New host is ${room.players[0].name}`);
+        }
+
+        const colors = ['RED', 'YELLOW', 'GREEN', 'BLUE'];
+        room.players.forEach((player, idx) => {
+          player.color = colors[idx] || 'YELLOW';
+        });
+
+        room.version++;
+        room.updatedAt = Date.now();
+        console.log(`[Ludo Server] Player ${playerId} left room ${code}. Colors reassigned.`);
+        return res.json({ success: true, roomDeleted: false, players: room.players, version: room.version });
+      }
+    }
+
+    res.json({ success: true, message: 'Player was not in the room' });
+  });
+
+  // Rotate non-host player colors
+  app.post('/api/rooms/:code/rotate', (req, res) => {
+    const code = req.params.code.toUpperCase().trim();
+    const { playerId } = req.body;
+    const room = activeRooms[code];
+
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    const requester = room.players.find((p) => p.id === playerId);
+    if (!requester || !requester.isCreator) {
+      return res.status(403).json({ error: 'Only the host can rotate players' });
+    }
+
+    room.players = room.players.map((player) => {
+      if (player.isCreator) {
+        return player;
+      }
+      if (player.color === 'YELLOW') {
+        player.color = 'BLUE';
+      } else if (player.color === 'GREEN') {
+        player.color = 'YELLOW';
+      } else if (player.color === 'BLUE') {
+        player.color = 'GREEN';
+      }
+      return player;
+    });
+
+    const colorOrder: Record<string, number> = { RED: 0, YELLOW: 1, GREEN: 2, BLUE: 3 };
+    room.players.sort((a, b) => (colorOrder[a.color] ?? 99) - (colorOrder[b.color] ?? 99));
+
+    room.version++;
+    room.updatedAt = Date.now();
+    console.log(`[Ludo Server] Room ${code} players rotated by host. New version: ${room.version}`);
+    res.json(room);
+  });
+
+  // Get room state (polling fallback with version-based fast polling)
+  app.get('/api/rooms/:code', (req, res) => {
+    const code = req.params.code.toUpperCase();
+    const room = activeRooms[code];
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    const clientVersion = req.query.v ? parseInt(req.query.v as string, 10) : undefined;
+    if (clientVersion !== undefined && room.version === clientVersion) {
+      return res.json({ changed: false, version: room.version });
+    }
 
     res.json({
-      roomCode,
-      playerId,
-      playerColor: 'red',
+      changed: true,
+      ...room
     });
   });
 
-  // Socket.IO real-time gameplay handler
-  io.on('connection', (socket) => {
-    let currentRoomCode: string | null = null;
-    let currentPlayerId: string | null = null;
+  // Update room gameState
+  app.post('/api/rooms/:code/update', (req, res) => {
+    const code = req.params.code.toUpperCase();
+    const { gameState } = req.body;
+    const room = activeRooms[code];
 
-    socket.on('join_room', ({ roomCode, playerName, playerId: reqPlayerId }) => {
-      const code = roomCode.toUpperCase();
-      const room = rooms[code];
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
 
-      if (!room) {
-        socket.emit('error_message', 'Room not found. Please check the code.');
-        return;
-      }
+    room.gameState = gameState;
+    room.version++;
+    room.updatedAt = Date.now();
+    res.json({ success: true, version: room.version });
+  });
 
-      if (room.players.length >= 4) {
-        socket.emit('error_message', 'Room is full (max 4 players).');
-        return;
-      }
+  // Toggle room teamUp mode
+  app.post('/api/rooms/:code/teamup', (req, res) => {
+    const code = req.params.code.toUpperCase();
+    const { isTeamUpMode } = req.body;
+    const room = activeRooms[code];
 
-      const playerId = reqPlayerId || 'ply-' + Math.random().toString(36).substring(2, 11);
-      
-      const availableColors = ['red', 'green', 'yellow', 'blue'].filter(
-        (c) => !room.players.some((p) => p.color === c)
-      );
-      const assignedColor = availableColors[0] || 'blue';
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
 
-      const existingPlayerIndex = room.players.findIndex((p) => p.id === playerId);
-      if (existingPlayerIndex === -1) {
-        room.players.push({
-          id: playerId,
-          name: playerName || `Player ${room.players.length + 1}`,
-          color: assignedColor,
-          isCreator: false,
-        });
-        room.colorToPlayer[assignedColor] = playerId;
-      }
+    room.isTeamUpMode = !!isTeamUpMode;
+    room.version++;
+    room.updatedAt = Date.now();
+    res.json({ success: true, version: room.version, isTeamUpMode: room.isTeamUpMode });
+  });
 
-      room.lastActivity = Date.now();
-      currentRoomCode = code;
-      currentPlayerId = playerId;
+  // WebRTC signaling exchange
+  app.post('/api/rooms/:code/signaling', (req, res) => {
+    const code = req.params.code.toUpperCase();
+    const { from, type, payload } = req.body;
+    const room = activeRooms[code];
 
-      socket.join(code);
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
 
-      console.log(`[Ludo Server] Player ${playerName} joined room: ${code}`);
+    room.signalingData.push({ from, type, payload });
+    if (room.signalingData.length > 20) {
+      room.signalingData.shift();
+    }
 
-      io.to(code).emit('room_updated', {
-        roomCode: code,
-        players: room.players,
-        gameState: room.gameState,
-      });
+    room.updatedAt = Date.now();
+    res.json({ success: true });
+  });
 
-      socket.emit('joined_successfully', {
-        playerId,
-        assignedColor,
-        roomCode: code,
-        players: room.players,
-        gameState: room.gameState,
-      });
-    });
-
-    socket.on('rejoin_room', ({ roomCode, playerId }) => {
-      const code = roomCode.toUpperCase();
-      const room = rooms[code];
-
-      if (!room) {
-        socket.emit('error_message', 'Room no longer exists.');
-        return;
-      }
-
-      const player = room.players.find((p) => p.id === playerId);
-      if (!player) {
-        socket.emit('error_message', 'Player not recognized in this room.');
-        return;
-      }
-
-      currentRoomCode = code;
-      currentPlayerId = playerId;
-      room.lastActivity = Date.now();
-
-      socket.join(code);
-
-      socket.emit('joined_successfully', {
-        playerId,
-        assignedColor: player.color,
-        roomCode: code,
-        players: room.players,
-        gameState: room.gameState,
-      });
-    });
-
-    socket.on('game_action', ({ roomCode, action, payload }) => {
-      const room = rooms[roomCode];
-      if (!room) return;
-
-      room.lastActivity = Date.now();
-
-      if (action === 'SYNC_STATE') {
-        room.gameState = payload;
-      }
-
-      socket.to(roomCode).emit('game_action_received', {
-        action,
-        payload,
-        senderId: currentPlayerId,
-      });
-    });
-
-    socket.on('chat_message', ({ roomCode, senderName, text }) => {
-      const room = rooms[roomCode];
-      if (!room) return;
-
-      io.to(roomCode).emit('new_chat_message', {
-        id: Math.random().toString(36).substring(2, 9),
-        senderName,
-        text,
-        timestamp: Date.now(),
-      });
-    });
-
-    socket.on('disconnect', () => {
-      if (currentRoomCode && currentPlayerId) {
-        const room = rooms[currentRoomCode];
-        if (room) {
-          room.players = room.players.filter((p) => p.id !== currentPlayerId);
-          
-          for (const color in room.colorToPlayer) {
-            if (room.colorToPlayer[color] === currentPlayerId) {
-              delete room.colorToPlayer[color];
-            }
-          }
-
-          console.log(`[Ludo Server] Player ${currentPlayerId} left room ${currentRoomCode}. Colors reassigned.`);
-
-          if (room.players.length === 0) {
-            delete rooms[currentRoomCode];
-            console.log(`[Ludo Server] Room ${currentRoomCode} deleted as all players left.`);
-          } else {
-            io.to(currentRoomCode).emit('room_updated', {
-              roomCode: currentRoomCode,
-              players: room.players,
-              gameState: room.gameState,
-            });
-          }
-        }
-      }
-    });
+  // Clear signaling
+  app.post('/api/rooms/:code/signaling/clear', (req, res) => {
+    const code = req.params.code.toUpperCase();
+    const room = activeRooms[code];
+    if (room) {
+      room.signalingData = [];
+    }
+    res.json({ success: true });
   });
 
   // --- VITE MIDDLEWARE & STATIC SERVING ---
@@ -272,11 +335,9 @@ async function startServer() {
     });
   }
 
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Ludo Server] Running on http://0.0.0.0:${PORT}`);
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[Ludo Server] Express custom server running on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer().catch((err) => {
-  console.error('[Ludo Server] Failed to start:', err);
-});
+startServer();
