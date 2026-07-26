@@ -72,8 +72,8 @@ async function startServer() {
   // Get latest App Version and upgrade links
   app.get('/api/app-version', (req, res) => {
     res.json({
-      latestVersion: '2.4',
-      minRequiredVersion: '2.4',
+      latestVersion: '1.0.0',
+      minRequiredVersion: '1.0.0',
       playStoreUrl: 'https://play.google.com/store/apps/details?id=com.gamers.ludo',
       appStoreUrl: 'https://apps.apple.com/app/ludo-battle-king/id1234567890',
     });
@@ -85,7 +85,7 @@ async function startServer() {
     
     // Generate a unique 6-digit uppercase alphanumeric room code
     let code = '';
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Avoid confusing chars like I, O, 1, 0
     do {
       code = '';
       for (let i = 0; i < 6; i++) {
@@ -101,7 +101,7 @@ async function startServer() {
           name: playerName || 'Player 1',
           color: 'RED',
           isCreator: true,
-          appVersion: appVersion || '2.4',
+          appVersion: appVersion || '1.0.0',
         },
       ],
       gameState: null,
@@ -133,6 +133,7 @@ async function startServer() {
     // Check if player already in room
     const exists = room.players.find((p) => p.id === playerId);
     if (!exists) {
+      // Allocate the next Ludo color sequentially
       const colors = ['RED', 'YELLOW', 'GREEN', 'BLUE'];
       const usedColors = room.players.map((p) => p.color);
       const color = colors.find((c) => !usedColors.includes(c)) || 'YELLOW';
@@ -142,7 +143,7 @@ async function startServer() {
         name: playerName || `Player ${room.players.length + 1}`,
         color,
         isCreator: false,
-        appVersion: appVersion || '2.4',
+        appVersion: appVersion || '1.0.0',
       });
       room.version++;
     } else {
@@ -176,11 +177,13 @@ async function startServer() {
         console.log(`[Ludo Server] Room ${code} is empty. Room deleted.`);
         return res.json({ success: true, roomDeleted: true });
       } else {
+        // If the host left, assign host to the next remaining player
         if (wasCreator) {
           room.players[0].isCreator = true;
           console.log(`[Ludo Server] Host left room ${code}. New host is ${room.players[0].name}`);
         }
 
+        // Reassign colors sequentially so that remaining players sit in RED, YELLOW, GREEN, BLUE in order
         const colors = ['RED', 'YELLOW', 'GREEN', 'BLUE'];
         room.players.forEach((player, idx) => {
           player.color = colors[idx] || 'YELLOW';
@@ -206,11 +209,16 @@ async function startServer() {
       return res.status(404).json({ error: 'Room not found' });
     }
 
+    // Verify if requester is indeed the host (isCreator: true)
     const requester = room.players.find((p) => p.id === playerId);
     if (!requester || !requester.isCreator) {
       return res.status(403).json({ error: 'Only the host can rotate players' });
     }
 
+    // Update player positions/colors:
+    // Green (GREEN) -> Yellow (YELLOW)
+    // Blue (BLUE) -> Green (GREEN)
+    // Yellow (YELLOW) -> Blue (BLUE)
     room.players = room.players.map((player) => {
       if (player.isCreator) {
         return player;
@@ -225,6 +233,7 @@ async function startServer() {
       return player;
     });
 
+    // Sort players so order is consistent in DB representation
     const colorOrder: Record<string, number> = { RED: 0, YELLOW: 1, GREEN: 2, BLUE: 3 };
     room.players.sort((a, b) => (colorOrder[a.color] ?? 99) - (colorOrder[b.color] ?? 99));
 
@@ -242,6 +251,7 @@ async function startServer() {
       return res.status(404).json({ error: 'Room not found' });
     }
 
+    // Check client version
     const clientVersion = req.query.v ? parseInt(req.query.v as string, 10) : undefined;
     if (clientVersion !== undefined && room.version === clientVersion) {
       return res.json({ changed: false, version: room.version });
@@ -295,7 +305,9 @@ async function startServer() {
       return res.status(404).json({ error: 'Room not found' });
     }
 
+    // Push new signaling message
     room.signalingData.push({ from, type, payload });
+    // Keep only last 20 signaling messages to save memory
     if (room.signalingData.length > 20) {
       room.signalingData.shift();
     }
@@ -304,7 +316,7 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  // Clear signaling
+  // Clear signaling (once connected)
   app.post('/api/rooms/:code/signaling/clear', (req, res) => {
     const code = req.params.code.toUpperCase();
     const room = activeRooms[code];
