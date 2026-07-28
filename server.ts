@@ -10,6 +10,7 @@ import fs from 'fs';
 interface RoomPlayer {
   id: string;
   name: string;
+  surname?: string;
   color: string;
   isCreator: boolean;
   appVersion?: string;
@@ -81,7 +82,7 @@ async function startServer() {
 
   // Create room
   app.post('/api/rooms/create', (req, res) => {
-    const { playerName, playerId, isTeamUpMode, appVersion } = req.body;
+    const { playerName, playerSurname, playerId, isTeamUpMode, appVersion } = req.body;
     
     // Generate a unique 6-digit uppercase alphanumeric room code
     let code = '';
@@ -99,6 +100,7 @@ async function startServer() {
         {
           id: playerId || 'player-1',
           name: playerName || 'Player 1',
+          surname: playerSurname || '',
           color: 'RED',
           isCreator: true,
           appVersion: appVersion || '1.0.0',
@@ -118,7 +120,7 @@ async function startServer() {
 
   // Join room
   app.post('/api/rooms/join', (req, res) => {
-    const { code, playerName, playerId, appVersion } = req.body;
+    const { code, playerName, playerSurname, playerId, appVersion } = req.body;
     const cleanCode = (code || '').toUpperCase().trim();
     const room = activeRooms[cleanCode];
 
@@ -141,6 +143,7 @@ async function startServer() {
       room.players.push({
         id: playerId,
         name: playerName || `Player ${room.players.length + 1}`,
+        surname: playerSurname || '',
         color,
         isCreator: false,
         appVersion: appVersion || '1.0.0',
@@ -149,6 +152,9 @@ async function startServer() {
     } else {
       if (appVersion) {
         exists.appVersion = appVersion;
+      }
+      if (playerSurname) {
+        exists.surname = playerSurname;
       }
     }
 
