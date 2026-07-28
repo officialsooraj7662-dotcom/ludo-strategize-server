@@ -21,6 +21,8 @@ interface Room {
   players: RoomPlayer[];
   gameState: any; // Complete board state sync
   isTeamUpMode?: boolean;
+  isHomeEntryLockEnabled?: boolean;
+  isTokenBlockEnabled?: boolean;
   signalingData: {
     from: string;
     type: string;
@@ -82,7 +84,7 @@ async function startServer() {
 
   // Create room
   app.post('/api/rooms/create', (req, res) => {
-    const { playerName, playerSurname, playerId, isTeamUpMode, appVersion } = req.body;
+    const { playerName, playerSurname, playerId, isTeamUpMode, isHomeEntryLockEnabled, isTokenBlockEnabled, appVersion } = req.body;
     
     // Generate a unique 6-digit uppercase alphanumeric room code
     let code = '';
@@ -107,7 +109,9 @@ async function startServer() {
         },
       ],
       gameState: null,
-      isTeamUpMode: !!isTeamUpMode,
+      isTeamUpMode: false, // Default false on creation; team-up mode requires 4 players
+      isHomeEntryLockEnabled: isHomeEntryLockEnabled !== false,
+      isTokenBlockEnabled: !!isTokenBlockEnabled,
       signalingData: [],
       updatedAt: Date.now(),
       version: 0,
@@ -194,6 +198,10 @@ async function startServer() {
         room.players.forEach((player, idx) => {
           player.color = colors[idx] || 'YELLOW';
         });
+
+        if (room.players.length < 4) {
+          room.isTeamUpMode = false;
+        }
 
         room.version++;
         room.updatedAt = Date.now();
@@ -295,10 +303,41 @@ async function startServer() {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    room.isTeamUpMode = !!isTeamUpMode;
+    room.isTeamUpMode = room.players.length === 4 ? !!isTeamUpMode : false;
     room.version++;
     room.updatedAt = Date.now();
     res.json({ success: true, version: room.version, isTeamUpMode: room.isTeamUpMode });
+  });
+
+  // Update room settings (toggles)
+  app.post('/api/rooms/:code/settings', (req, res) => {
+    const code = req.params.code.toUpperCase().trim();
+    const { isTeamUpMode, isHomeEntryLockEnabled, isTokenBlockEnabled, playerId } = req.body;
+    const room = activeRooms[code];
+
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    const requester = room.players.find((p) => p.id === playerId);
+    if (requester && !requester.isCreator) {
+      return res.status(403).json({ error: 'Only the host can modify room settings' });
+    }
+
+    if (isTeamUpMode !== undefined) {
+      room.isTeamUpMode = room.players.length === 4 ? !!isTeamUpMode : false;
+    }
+    if (isHomeEntryLockEnabled !== undefined) {
+      room.isHomeEntryLockEnabled = !!isHomeEntryLockEnabled;
+    }
+    if (isTokenBlockEnabled !== undefined) {
+      room.isTokenBlockEnabled = !!isTokenBlockEnabled;
+    }
+
+    room.version++;
+    room.updatedAt = Date.now();
+    console.log(`[Ludo Server] Room ${code} settings updated. New version: ${room.version}`);
+    res.json(room);
   });
 
   // WebRTC signaling exchange
