@@ -223,6 +223,11 @@ async function startServer() {
       return res.status(404).json({ error: 'Room not found' });
     }
 
+    // Verify player count is at least 3 (3 or 4 players)
+    if (room.players.length < 3) {
+      return res.status(400).json({ error: 'Swap players requires at least 3 players in the lobby' });
+    }
+
     // Verify if requester is indeed the host (isCreator: true)
     const requester = room.players.find((p) => p.id === playerId);
     if (!requester || !requester.isCreator) {
