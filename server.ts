@@ -25,11 +25,6 @@ interface Room {
   isTeamUpMode?: boolean;
   isHomeEntryLockEnabled?: boolean;
   isTokenBlockEnabled?: boolean;
-  signalingData: {
-    from: string;
-    type: string;
-    payload: any;
-  }[];
   updatedAt: number;
   version: number;
 }
@@ -220,7 +215,6 @@ async function startServer() {
       isTeamUpMode: false, // Default false on creation; team-up mode requires 4 players
       isHomeEntryLockEnabled: isHomeEntryLockEnabled !== false,
       isTokenBlockEnabled: !!isTokenBlockEnabled,
-      signalingData: [],
       updatedAt: Date.now(),
       version: 0,
     };
@@ -451,37 +445,6 @@ async function startServer() {
     room.updatedAt = Date.now();
     console.log(`[Ludo Server] Room ${code} settings updated. New version: ${room.version}`);
     res.json(room);
-  });
-
-  // WebRTC signaling exchange
-  app.post('/api/rooms/:code/signaling', (req, res) => {
-    const code = req.params.code.toUpperCase();
-    const { from, type, payload } = req.body;
-    const room = activeRooms[code];
-
-    if (!room) {
-      return res.status(404).json({ error: 'Room not found' });
-    }
-
-    // Push new signaling message
-    room.signalingData.push({ from, type, payload });
-    // Keep only last 20 signaling messages to save memory
-    if (room.signalingData.length > 20) {
-      room.signalingData.shift();
-    }
-
-    room.updatedAt = Date.now();
-    res.json({ success: true });
-  });
-
-  // Clear signaling (once connected)
-  app.post('/api/rooms/:code/signaling/clear', (req, res) => {
-    const code = req.params.code.toUpperCase();
-    const room = activeRooms[code];
-    if (room) {
-      room.signalingData = [];
-    }
-    res.json({ success: true });
   });
 
   // --- VITE MIDDLEWARE & STATIC SERVING ---
