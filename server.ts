@@ -6,8 +6,6 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
-import http from 'http';
-import { WebSocketServer, WebSocket } from 'ws';
 
 interface RoomPlayer {
   id: string;
@@ -25,14 +23,13 @@ interface Room {
   isTeamUpMode?: boolean;
   isHomeEntryLockEnabled?: boolean;
   isTokenBlockEnabled?: boolean;
+  signalingData: {
+    from: string;
+    type: string;
+    payload: any;
+  }[];
   updatedAt: number;
   version: number;
-}
-
-interface ExtWebSocket extends WebSocket {
-  roomCode?: string;
-  playerId?: string;
-  isAlive?: boolean;
 }
 
 const activeRooms: Record<string, Room> = {};
@@ -50,112 +47,6 @@ setInterval(() => {
 async function startServer() {
   const app = express();
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-  const server = http.createServer(app);
-  const wss = new WebSocketServer({ server });
-
-  // Heartbeat interval to detect dead clients
-  const heartbeatInterval = setInterval(() => {
-    wss.clients.forEach((client) => {
-      const extWs = client as ExtWebSocket;
-      if (extWs.isAlive === false) {
-        return extWs.terminate();
-      }
-      extWs.isAlive = false;
-      extWs.ping();
-    });
-  }, 25000);
-
-  wss.on('close', () => {
-    clearInterval(heartbeatInterval);
-  });
-
-  // Handle WebSocket connections
-  wss.on('connection', (ws: WebSocket) => {
-    const extWs = ws as ExtWebSocket;
-    extWs.isAlive = true;
-
-    extWs.on('pong', () => {
-      extWs.isAlive = true;
-    });
-
-    extWs.on('message', (message: string) => {
-      try {
-        const data = JSON.parse(message.toString());
-        const { type, roomCode, senderId, playerId } = data;
-
-        if (type === 'JOIN_ROOM') {
-          const cleanCode = (roomCode || '').toUpperCase().trim();
-          extWs.roomCode = cleanCode;
-          extWs.playerId = playerId || senderId;
-          console.log(`[WebSocket] Player ${extWs.playerId} joined WebSocket channel for room ${cleanCode}`);
-
-          const currentRoom = activeRooms[cleanCode];
-          extWs.send(JSON.stringify({
-            type: 'ROOM_JOINED',
-            roomCode: cleanCode,
-            playerId: extWs.playerId,
-            gameState: currentRoom?.gameState || null
-          }));
-
-          // Broadcast player connection event to all other clients in room
-          wss.clients.forEach((client) => {
-            const target = client as ExtWebSocket;
-            if (target !== extWs && target.readyState === WebSocket.OPEN && target.roomCode === cleanCode) {
-              target.send(JSON.stringify({ type: 'PLAYER_CONNECTED', playerId: extWs.playerId }));
-            }
-          });
-          return;
-        }
-
-        if (type === 'LEAVE_ROOM') {
-          const cleanCode = (roomCode || extWs.roomCode || '').toUpperCase().trim();
-          if (cleanCode) {
-            wss.clients.forEach((client) => {
-              const target = client as ExtWebSocket;
-              if (target !== extWs && target.readyState === WebSocket.OPEN && target.roomCode === cleanCode) {
-                target.send(JSON.stringify({ type: 'PLAYER_DISCONNECTED', playerId: extWs.playerId }));
-              }
-            });
-          }
-          extWs.roomCode = undefined;
-          return;
-        }
-
-        // Relay any game action / state update message to all other connected clients in the room
-        const targetRoomCode = (roomCode || extWs.roomCode || '').toUpperCase().trim();
-        if (targetRoomCode) {
-          // If message carries updated game state, update server memory as well
-          if (data.gameState && activeRooms[targetRoomCode]) {
-            activeRooms[targetRoomCode].gameState = data.gameState;
-            activeRooms[targetRoomCode].updatedAt = Date.now();
-          }
-
-          wss.clients.forEach((client) => {
-            const target = client as ExtWebSocket;
-            if (target !== extWs && target.readyState === WebSocket.OPEN && target.roomCode === targetRoomCode) {
-              target.send(message.toString());
-            }
-          });
-        }
-      } catch (err) {
-        console.error('[WebSocket] Failed to process incoming message:', err);
-      }
-    });
-
-    extWs.on('close', () => {
-      if (extWs.roomCode && extWs.playerId) {
-        const code = extWs.roomCode;
-        const pId = extWs.playerId;
-        console.log(`[WebSocket] Player ${pId} disconnected from room ${code}`);
-        wss.clients.forEach((client) => {
-          const target = client as ExtWebSocket;
-          if (target !== extWs && target.readyState === WebSocket.OPEN && target.roomCode === code) {
-            target.send(JSON.stringify({ type: 'PLAYER_DISCONNECTED', playerId: pId }));
-          }
-        });
-      }
-    });
-  });
 
   // --- CORS MIDDLEWARE (Required for Render and external app connections) ---
   app.use((req, res, next) => {
@@ -221,6 +112,7 @@ async function startServer() {
       isTeamUpMode: false, // Default false on creation; team-up mode requires 4 players
       isHomeEntryLockEnabled: isHomeEntryLockEnabled !== false,
       isTokenBlockEnabled: !!isTokenBlockEnabled,
+      signalingData: [],
       updatedAt: Date.now(),
       version: 0,
     };
@@ -453,6 +345,37 @@ async function startServer() {
     res.json(room);
   });
 
+  // WebRTC signaling exchange
+  app.post('/api/rooms/:code/signaling', (req, res) => {
+    const code = req.params.code.toUpperCase();
+    const { from, type, payload } = req.body;
+    const room = activeRooms[code];
+
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    // Push new signaling message
+    room.signalingData.push({ from, type, payload });
+    // Keep only last 20 signaling messages to save memory
+    if (room.signalingData.length > 20) {
+      room.signalingData.shift();
+    }
+
+    room.updatedAt = Date.now();
+    res.json({ success: true });
+  });
+
+  // Clear signaling (once connected)
+  app.post('/api/rooms/:code/signaling/clear', (req, res) => {
+    const code = req.params.code.toUpperCase();
+    const room = activeRooms[code];
+    if (room) {
+      room.signalingData = [];
+    }
+    res.json({ success: true });
+  });
+
   // --- VITE MIDDLEWARE & STATIC SERVING ---
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -474,8 +397,8 @@ async function startServer() {
     });
   }
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Ludo Server] Custom Express + WebSocket server running on http://0.0.0.0:${PORT}`);
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[Ludo Server] Express custom server running on http://0.0.0.0:${PORT}`);
   });
 }
 
