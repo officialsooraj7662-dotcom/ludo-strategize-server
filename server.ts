@@ -4,8 +4,10 @@
  */
 
 import express from 'express';
+import http from 'http';
 import path from 'path';
 import fs from 'fs';
+import { WebSocketServer, WebSocket } from 'ws';
 
 interface RoomPlayer {
   id: string;
@@ -23,11 +25,6 @@ interface Room {
   isTeamUpMode?: boolean;
   isHomeEntryLockEnabled?: boolean;
   isTokenBlockEnabled?: boolean;
-  signalingData: {
-    from: string;
-    type: string;
-    payload: any;
-  }[];
   updatedAt: number;
   version: number;
 }
@@ -43,6 +40,17 @@ setInterval(() => {
     }
   });
 }, 30 * 60 * 1000);
+
+// WebSocket Client Metadata interface
+interface ClientMeta {
+  ws: WebSocket;
+  roomCode: string;
+  playerId: string;
+  playerName?: string;
+  playerColor?: string;
+}
+
+const connectedClients = new Map<WebSocket, ClientMeta>();
 
 async function startServer() {
   const app = express();
@@ -69,7 +77,11 @@ async function startServer() {
 
   // Health check
   app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', activeRoomsCount: Object.keys(activeRooms).length });
+    res.json({
+      status: 'ok',
+      activeRoomsCount: Object.keys(activeRooms).length,
+      connectedWsClients: connectedClients.size,
+    });
   });
 
   // Get latest App Version and upgrade links
@@ -109,10 +121,9 @@ async function startServer() {
         },
       ],
       gameState: null,
-      isTeamUpMode: false, // Default false on creation; team-up mode requires 4 players
+      isTeamUpMode: false,
       isHomeEntryLockEnabled: isHomeEntryLockEnabled !== false,
       isTokenBlockEnabled: !!isTokenBlockEnabled,
-      signalingData: [],
       updatedAt: Date.now(),
       version: 0,
     };
@@ -164,6 +175,13 @@ async function startServer() {
 
     room.updatedAt = Date.now();
     console.log(`[Ludo Server] Player ${playerName} joined room: ${cleanCode}`);
+
+    // Broadcast room update to connected WS clients in this room
+    broadcastToRoom(cleanCode, {
+      type: 'LOBBY_UPDATE',
+      room,
+    });
+
     res.json(room);
   });
 
@@ -193,7 +211,7 @@ async function startServer() {
           console.log(`[Ludo Server] Host left room ${code}. New host is ${room.players[0].name}`);
         }
 
-        // Reassign colors sequentially so that remaining players sit in RED, YELLOW, GREEN, BLUE in order
+        // Reassign colors sequentially
         const colors = ['RED', 'YELLOW', 'GREEN', 'BLUE'];
         room.players.forEach((player, idx) => {
           player.color = colors[idx] || 'YELLOW';
@@ -206,6 +224,13 @@ async function startServer() {
         room.version++;
         room.updatedAt = Date.now();
         console.log(`[Ludo Server] Player ${playerId} left room ${code}. Colors reassigned.`);
+
+        // Broadcast to WS clients
+        broadcastToRoom(code, {
+          type: 'LOBBY_UPDATE',
+          room,
+        });
+
         return res.json({ success: true, roomDeleted: false, players: room.players, version: room.version });
       }
     }
@@ -234,10 +259,6 @@ async function startServer() {
       return res.status(403).json({ error: 'Only the host can rotate players' });
     }
 
-    // Update player positions/colors:
-    // Green (GREEN) -> Yellow (YELLOW)
-    // Blue (BLUE) -> Green (GREEN)
-    // Yellow (YELLOW) -> Blue (BLUE)
     room.players = room.players.map((player) => {
       if (player.isCreator) {
         return player;
@@ -252,17 +273,22 @@ async function startServer() {
       return player;
     });
 
-    // Sort players so order is consistent in DB representation
     const colorOrder: Record<string, number> = { RED: 0, YELLOW: 1, GREEN: 2, BLUE: 3 };
     room.players.sort((a, b) => (colorOrder[a.color] ?? 99) - (colorOrder[b.color] ?? 99));
 
     room.version++;
     room.updatedAt = Date.now();
     console.log(`[Ludo Server] Room ${code} players rotated by host. New version: ${room.version}`);
+
+    broadcastToRoom(code, {
+      type: 'LOBBY_UPDATE',
+      room,
+    });
+
     res.json(room);
   });
 
-  // Get room state (polling fallback with version-based fast polling)
+  // Get room state
   app.get('/api/rooms/:code', (req, res) => {
     const code = req.params.code.toUpperCase();
     const room = activeRooms[code];
@@ -270,7 +296,6 @@ async function startServer() {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    // Check client version
     const clientVersion = req.query.v ? parseInt(req.query.v as string, 10) : undefined;
     if (clientVersion !== undefined && room.version === clientVersion) {
       return res.json({ changed: false, version: room.version });
@@ -311,6 +336,12 @@ async function startServer() {
     room.isTeamUpMode = room.players.length === 4 ? !!isTeamUpMode : false;
     room.version++;
     room.updatedAt = Date.now();
+
+    broadcastToRoom(code, {
+      type: 'LOBBY_UPDATE',
+      room,
+    });
+
     res.json({ success: true, version: room.version, isTeamUpMode: room.isTeamUpMode });
   });
 
@@ -342,38 +373,134 @@ async function startServer() {
     room.version++;
     room.updatedAt = Date.now();
     console.log(`[Ludo Server] Room ${code} settings updated. New version: ${room.version}`);
+
+    broadcastToRoom(code, {
+      type: 'LOBBY_UPDATE',
+      room,
+    });
+
     res.json(room);
   });
 
-  // WebRTC signaling exchange
-  app.post('/api/rooms/:code/signaling', (req, res) => {
-    const code = req.params.code.toUpperCase();
-    const { from, type, payload } = req.body;
-    const room = activeRooms[code];
+  // Create HTTP Server
+  const server = http.createServer(app);
 
-    if (!room) {
-      return res.status(404).json({ error: 'Room not found' });
-    }
+  // --- WEBSOCKET REALTIME ENGINE ---
+  const wss = new WebSocketServer({ server });
 
-    // Push new signaling message
-    room.signalingData.push({ from, type, payload });
-    // Keep only last 20 signaling messages to save memory
-    if (room.signalingData.length > 20) {
-      room.signalingData.shift();
-    }
+  // Broadcast helper function to send message to room members
+  function broadcastToRoom(roomCode: string, message: any, excludeWs?: WebSocket) {
+    const serialized = JSON.stringify(message);
+    connectedClients.forEach((meta, clientWs) => {
+      if (meta.roomCode === roomCode && clientWs.readyState === WebSocket.OPEN) {
+        if (!excludeWs || clientWs !== excludeWs) {
+          try {
+            clientWs.send(serialized);
+          } catch (err) {
+            console.error(`[WebSocket] Error broadcasting to player ${meta.playerId}:`, err);
+          }
+        }
+      }
+    });
+  }
 
-    room.updatedAt = Date.now();
-    res.json({ success: true });
-  });
+  wss.on('connection', (ws: WebSocket) => {
+    console.log('[WebSocket] New client connected');
 
-  // Clear signaling (once connected)
-  app.post('/api/rooms/:code/signaling/clear', (req, res) => {
-    const code = req.params.code.toUpperCase();
-    const room = activeRooms[code];
-    if (room) {
-      room.signalingData = [];
-    }
-    res.json({ success: true });
+    ws.on('message', (messageRaw: string) => {
+      try {
+        const messageStr = messageRaw.toString();
+        const data = JSON.parse(messageStr);
+
+        // 1. JOIN_ROOM Event
+        if (data.type === 'JOIN_ROOM') {
+          const roomCode = (data.roomCode || '').toUpperCase().trim();
+          const playerId = data.playerId || data.userId || 'unknown';
+          const playerName = data.playerName || 'Player';
+          const playerColor = data.playerColor || 'RED';
+
+          connectedClients.set(ws, {
+            ws,
+            roomCode,
+            playerId,
+            playerName,
+            playerColor,
+          });
+
+          console.log(`[WebSocket] Client ${playerId} (${playerName}) joined room ${roomCode}`);
+
+          // Acknowledge connection to sender
+          ws.send(JSON.stringify({
+            type: 'ROOM_JOINED',
+            roomCode,
+            playerId,
+            success: true,
+          }));
+
+          // Notify other clients in the room that a player is active
+          broadcastToRoom(roomCode, {
+            type: 'PLAYER_CONNECTED',
+            playerId,
+            playerName,
+            playerColor,
+          }, ws);
+
+          // If room exists and has gameState, send current snapshot to this client
+          const existingRoom = activeRooms[roomCode];
+          if (existingRoom && existingRoom.gameState) {
+            ws.send(JSON.stringify({
+              type: 'STATE_SYNC',
+              gameState: existingRoom.gameState,
+            }));
+          }
+          return;
+        }
+
+        // 2. Ping / Keep-Alive
+        if (data.type === 'PING') {
+          ws.send(JSON.stringify({ type: 'PONG', timestamp: Date.now() }));
+          return;
+        }
+
+        // 3. Gameplay Relay Actions
+        const meta = connectedClients.get(ws);
+        const roomCode = (data.roomCode || meta?.roomCode || '').toUpperCase().trim();
+
+        if (roomCode) {
+          // Update room's cached gameState on server if provided
+          if (data.gameState && activeRooms[roomCode]) {
+            activeRooms[roomCode].gameState = data.gameState;
+            activeRooms[roomCode].updatedAt = Date.now();
+            activeRooms[roomCode].version++;
+          }
+
+          // Relay action to all other peers in the room immediately
+          broadcastToRoom(roomCode, data, ws);
+        }
+      } catch (err) {
+        console.error('[WebSocket] Message parsing error:', err);
+      }
+    });
+
+    ws.on('close', () => {
+      const meta = connectedClients.get(ws);
+      if (meta) {
+        console.log(`[WebSocket] Client ${meta.playerId} disconnected from room ${meta.roomCode}`);
+        connectedClients.delete(ws);
+
+        // Notify remaining players
+        if (meta.roomCode) {
+          broadcastToRoom(meta.roomCode, {
+            type: 'PLAYER_DISCONNECTED',
+            playerId: meta.playerId,
+          });
+        }
+      }
+    });
+
+    ws.on('error', (err) => {
+      console.error('[WebSocket] Socket error:', err);
+    });
   });
 
   // --- VITE MIDDLEWARE & STATIC SERVING ---
@@ -397,8 +524,8 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Ludo Server] Express custom server running on http://0.0.0.0:${PORT}`);
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`[Ludo Server] Express + WebSocket server running on http://0.0.0.0:${PORT}`);
   });
 }
 
