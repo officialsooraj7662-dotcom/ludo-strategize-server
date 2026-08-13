@@ -390,9 +390,13 @@ async function startServer() {
 
   // Broadcast helper function to send message to room members
   function broadcastToRoom(roomCode: string, message: any, excludeWs?: WebSocket) {
+    const normalizedTarget = (roomCode || '').toUpperCase().trim();
+    if (!normalizedTarget) return;
+
     const serialized = JSON.stringify(message);
     connectedClients.forEach((meta, clientWs) => {
-      if (meta.roomCode === roomCode && clientWs.readyState === WebSocket.OPEN) {
+      const clientRoom = (meta.roomCode || '').toUpperCase().trim();
+      if (clientRoom === normalizedTarget && clientWs.readyState === WebSocket.OPEN) {
         if (!excludeWs || clientWs !== excludeWs) {
           try {
             clientWs.send(serialized);
@@ -465,6 +469,10 @@ async function startServer() {
         // 3. Gameplay Relay Actions
         const meta = connectedClients.get(ws);
         const roomCode = (data.roomCode || meta?.roomCode || '').toUpperCase().trim();
+
+        if (meta && roomCode && !meta.roomCode) {
+          meta.roomCode = roomCode;
+        }
 
         if (roomCode) {
           // Update room's cached gameState on server if provided
