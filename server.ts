@@ -20,6 +20,8 @@ export interface RoomPlayer {
   color: PlayerColor;
   isCreator: boolean;
   isBot?: boolean;
+  isOffline?: boolean;
+  hasQuit?: boolean;
   ws?: WebSocket;
   isAlive?: boolean;
 }
@@ -34,11 +36,14 @@ export interface SignalingRoom {
     avatar?: string;
     isCreator: boolean;
     isBot?: boolean;
+    isOffline?: boolean;
+    hasQuit?: boolean;
   }[];
   isTeamUpMode: boolean;
   isHomeEntryLockEnabled: boolean;
   isTokenBlockEnabled: boolean;
   gameStarted: boolean;
+  gameState?: any;
   createdAt: number;
 }
 
@@ -50,11 +55,38 @@ interface RoomData {
   isHomeEntryLockEnabled: boolean;
   isTokenBlockEnabled: boolean;
   gameStarted: boolean;
+  gameState?: any;
+  winnerColor?: string | null;
   createdAt: number;
 }
 
 // In-Memory Room Store
 const rooms = new Map<string, RoomData>();
+
+// 40 realistic English names for opponents in online matchmaking
+const OPPONENT_NAMES = [
+  "Oliver", "Emma", "Liam", "Olivia", "Noah",
+  "Ava", "Ethan", "Sophia", "Mason", "Isabella",
+  "William", "Mia", "James", "Charlotte", "Benjamin",
+  "Amelia", "Lucas", "Harper", "Alexander", "Evelyn",
+  "Daniel", "Emily", "Henry", "Abigail", "Michael",
+  "Ella", "Jackson", "Scarlett", "Sebastian", "Grace",
+  "Jack", "Chloe", "Aiden", "Victoria", "Matthew",
+  "Lily", "Samuel", "Zoe", "David", "Luna"
+];
+
+// Helper to get random distinct names from OPPONENT_NAMES
+function getRandomOpponentNames(count: number, excludeNames: string[] = []): string[] {
+  const available = OPPONENT_NAMES.filter((n) => !excludeNames.includes(n));
+  // Shuffle array
+  for (let i = available.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const temp = available[i];
+    available[i] = available[j];
+    available[j] = temp;
+  }
+  return available.slice(0, count);
+}
 
 // --- GLOBAL AUTO MATCHMAKING QUEUE (60 SECONDS TIMEOUT) ---
 interface QueuePlayer {
@@ -77,6 +109,12 @@ function broadcastQueueUpdate() {
     count: activeQueue.length,
     timeLeft: matchmakingCountdown,
     totalTime: MATCHMAKING_TIMEOUT,
+    players: activeQueue.map((qp, idx) => ({
+      id: qp.playerId,
+      name: qp.playerName || `Player ${idx + 1}`,
+      surname: qp.playerSurname || "",
+      avatar: qp.playerAvatar || "",
+    })),
   });
   for (const qp of activeQueue) {
     if (qp.ws && qp.ws.readyState === WebSocket.OPEN) {
@@ -110,23 +148,20 @@ function launchAutoMatch(batch: QueuePlayer[]) {
     });
   });
 
-  // Fill remaining empty slots up to 4 with AI Bots
+  // Fill remaining empty slots up to 4 with unique random realistic player names
   const realCount = batch.length;
-  const botNames: Record<PlayerColor, string> = {
-    RED: "Bot Red",
-    GREEN: "Bot Green",
-    YELLOW: "Bot Yellow",
-    BLUE: "Bot Blue",
-  };
+  const realPlayerNames = batch.map((qp) => qp.playerName || "");
+  const assignedOpponentNames = getRandomOpponentNames(4 - realCount, realPlayerNames);
 
   for (let i = realCount; i < 4; i++) {
-    const botColor = colors[i];
+    const slotColor = colors[i];
+    const opponentName = assignedOpponentNames[i - realCount] || `Player ${i + 1}`;
     roomPlayers.push({
-      id: `bot_${botColor.toLowerCase()}_${Date.now()}_${Math.floor(Math.random() * 8999 + 1000)}`,
-      name: botNames[botColor],
-      surname: "AI",
+      id: `player_${slotColor.toLowerCase()}_${Date.now()}_${Math.floor(Math.random() * 8999 + 1000)}`,
+      name: opponentName,
+      surname: "",
       avatar: "",
-      color: botColor,
+      color: slotColor,
       isCreator: false,
       isBot: true,
     });
@@ -144,7 +179,7 @@ function launchAutoMatch(batch: QueuePlayer[]) {
   };
 
   rooms.set(roomCode, newRoom);
-  console.log(`[WS] Auto Match Launched in Room ${roomCode}! Real players: ${realCount}, Bots: ${4 - realCount}`);
+  console.log(`[WS] Auto Match Launched in Room ${roomCode}! Total players: ${roomPlayers.length} (Real: ${realCount}, Matched: ${4 - realCount})`);
 
   const sanitized = getSanitizedRoom(newRoom);
   broadcastToRoom(newRoom, {
@@ -221,11 +256,14 @@ function getSanitizedRoom(room: RoomData): SignalingRoom {
       avatar: p.avatar,
       isCreator: p.isCreator,
       isBot: Boolean(p.isBot),
+      isOffline: Boolean(p.isOffline),
+      hasQuit: Boolean(p.hasQuit),
     })),
     isTeamUpMode: room.isTeamUpMode,
     isHomeEntryLockEnabled: room.isHomeEntryLockEnabled,
     isTokenBlockEnabled: room.isTokenBlockEnabled,
     gameStarted: room.gameStarted,
+    gameState: room.gameState,
     createdAt: room.createdAt,
   };
 }
@@ -294,6 +332,29 @@ async function startServer() {
       return res.status(404).json({ error: "Room not found" });
     }
     return res.json(getSanitizedRoom(room));
+  });
+
+  // REST endpoint to check if a player has an active ongoing match
+  app.get("/api/player-active-match/:playerId", (req, res) => {
+    const { playerId } = req.params;
+    if (!playerId) {
+      return res.json({ hasActiveMatch: false });
+    }
+    for (const [code, room] of rooms.entries()) {
+      if (room.gameStarted && !room.winnerColor) {
+        const p = room.players.find((player) => player.id === playerId && !player.hasQuit);
+        if (p) {
+          return res.json({
+            hasActiveMatch: true,
+            roomCode: code,
+            yourColor: p.color,
+            isTeamUpMode: room.isTeamUpMode,
+            createdAt: room.createdAt,
+          });
+        }
+      }
+    }
+    return res.json({ hasActiveMatch: false });
   });
 
   const server = http.createServer(app);
@@ -631,35 +692,173 @@ async function startServer() {
           return;
         }
 
-        // 7. SYNC_GAME_STATE / GAME_ACTION (Live state synchronization for online room matches)
-        if (type === "SYNC_GAME_STATE" || type === "GAME_ACTION") {
-          const { roomCode } = data;
-          if (!roomCode) return;
-          const room = rooms.get(roomCode.toUpperCase());
-          if (!room) return;
-          broadcastToRoom(room, data);
+        // 6. CHECK_ACTIVE_MATCH
+        if (type === "CHECK_ACTIVE_MATCH" || type === "check_active_match") {
+          const { playerId } = data;
+          if (!playerId) {
+            ws.send(JSON.stringify({ type: "NO_ACTIVE_MATCH" }));
+            return;
+          }
+          let found = false;
+          for (const [code, room] of rooms.entries()) {
+            if (room.gameStarted && !room.winnerColor) {
+              const p = room.players.find((player) => player.id === playerId && !player.hasQuit);
+              if (p) {
+                found = true;
+                ws.send(
+                  JSON.stringify({
+                    type: "ACTIVE_MATCH_FOUND",
+                    roomCode: code,
+                    yourColor: p.color,
+                    room: getSanitizedRoom(room),
+                    gameState: room.gameState,
+                  })
+                );
+                break;
+              }
+            }
+          }
+          if (!found) {
+            ws.send(JSON.stringify({ type: "NO_ACTIVE_MATCH" }));
+          }
           return;
         }
 
-        // 8. LEAVE_ROOM
-        if (type === "LEAVE_ROOM") {
-          if (currentRoomCode && currentPlayerId) {
-            const room = rooms.get(currentRoomCode);
-            if (room) {
-              room.players = room.players.filter((p) => p.id !== currentPlayerId);
-              if (room.players.length === 0) {
-                rooms.delete(currentRoomCode);
-                console.log(`[WS] Room ${currentRoomCode} deleted (all players left).`);
-              } else {
-                if (room.hostId === currentPlayerId) {
-                  room.hostId = room.players[0].id;
-                  room.players[0].isCreator = true;
-                }
+        // 7. REJOIN_MATCH / rejoin_match
+        if (type === "REJOIN_MATCH" || type === "rejoin_match") {
+          const { roomCode, playerId, playerName } = data;
+          if (!roomCode || !playerId) {
+            ws.send(JSON.stringify({ type: "ERROR", message: "Missing room code or player ID" }));
+            return;
+          }
+          const code = roomCode.trim().toUpperCase();
+          const room = rooms.get(code);
+          if (!room || !room.gameStarted) {
+            ws.send(JSON.stringify({ type: "ERROR", message: "Match is no longer active or room has closed." }));
+            return;
+          }
+          const player = room.players.find((p) => p.id === playerId);
+          if (!player) {
+            ws.send(JSON.stringify({ type: "ERROR", message: "Player not found in this match." }));
+            return;
+          }
+          player.ws = ws;
+          player.isOffline = false;
+          player.hasQuit = false;
+          if (playerName) player.name = playerName;
+          currentRoomCode = code;
+          currentPlayerId = playerId;
+
+          const sanitized = getSanitizedRoom(room);
+          ws.send(
+            JSON.stringify({
+              type: "REJOIN_SUCCESS",
+              room: sanitized,
+              yourColor: player.color,
+              gameState: room.gameState,
+            })
+          );
+
+          broadcastToRoom(room, {
+            type: "PLAYER_RECONNECTED",
+            playerId: player.id,
+            color: player.color,
+            name: player.name,
+            room: sanitized,
+          });
+          console.log(`[WS] Player ${player.name} (${playerId}) REJOINED active room ${code}!`);
+          return;
+        }
+
+        // 8. FORFEIT_MATCH / forfeit_match / LEAVE_MATCH
+        if (type === "FORFEIT_MATCH" || type === "forfeit_match" || type === "LEAVE_MATCH") {
+          const targetCode = data.roomCode || currentRoomCode;
+          const targetPlayerId = data.playerId || currentPlayerId;
+          if (targetCode && targetPlayerId) {
+            const room = rooms.get(targetCode.toUpperCase());
+            if (room && room.gameStarted) {
+              const p = room.players.find((player) => player.id === targetPlayerId);
+              if (p) {
+                p.isOffline = true;
+                p.hasQuit = true;
                 const sanitized = getSanitizedRoom(room);
                 broadcastToRoom(room, {
                   type: "ROOM_UPDATED",
                   room: sanitized,
                 });
+                broadcastToRoom(room, {
+                  type: "PLAYER_OFFLINE",
+                  playerId: p.id,
+                  color: p.color,
+                  name: p.name,
+                  room: sanitized,
+                });
+              }
+            }
+          }
+          if (currentRoomCode === targetCode) currentRoomCode = null;
+          if (currentPlayerId === targetPlayerId) currentPlayerId = null;
+          return;
+        }
+
+        // 9. SYNC_GAME_STATE / GAME_ACTION (Live state synchronization for online room matches)
+        if (type === "SYNC_GAME_STATE" || type === "GAME_ACTION") {
+          const { roomCode, gameState } = data;
+          if (!roomCode) return;
+          const room = rooms.get(roomCode.toUpperCase());
+          if (!room) return;
+          if (gameState) {
+            room.gameState = gameState;
+            if (gameState.winnerColor) {
+              room.winnerColor = gameState.winnerColor;
+            }
+          }
+          broadcastToRoom(room, data);
+          return;
+        }
+
+        // 10. LEAVE_ROOM / leave_lobby
+        if (type === "LEAVE_ROOM" || type === "leave_lobby") {
+          const targetCode = data.roomCode || currentRoomCode;
+          const targetPlayerId = data.playerId || currentPlayerId;
+          if (targetCode && targetPlayerId) {
+            const room = rooms.get(targetCode.toUpperCase());
+            if (room) {
+              if (!room.gameStarted) {
+                // In Lobby: Remove player and immediately make slot vacant for others
+                room.players = room.players.filter((p) => p.id !== targetPlayerId);
+                if (room.players.length === 0) {
+                  rooms.delete(targetCode.toUpperCase());
+                  console.log(`[WS] Room ${targetCode} deleted (all players left lobby).`);
+                } else {
+                  if (room.hostId === targetPlayerId) {
+                    room.hostId = room.players[0].id;
+                    room.players[0].isCreator = true;
+                  }
+                  const sanitized = getSanitizedRoom(room);
+                  broadcastToRoom(room, {
+                    type: "ROOM_UPDATED",
+                    room: sanitized,
+                  });
+                }
+              } else {
+                // In Active Match: Mark player as Offline so pawns remain on board
+                const p = room.players.find((player) => player.id === targetPlayerId);
+                if (p) {
+                  p.isOffline = true;
+                  const sanitized = getSanitizedRoom(room);
+                  broadcastToRoom(room, {
+                    type: "ROOM_UPDATED",
+                    room: sanitized,
+                  });
+                  broadcastToRoom(room, {
+                    type: "PLAYER_OFFLINE",
+                    playerId: p.id,
+                    color: p.color,
+                    name: p.name,
+                    room: sanitized,
+                  });
+                }
               }
             }
           }
@@ -681,24 +880,46 @@ async function startServer() {
         broadcastQueueUpdate();
       }
 
-      // 2. Remove from private room if game not started
+      // 2. Private room handling on disconnect
       if (currentRoomCode && currentPlayerId) {
         const room = rooms.get(currentRoomCode);
-        if (room && !room.gameStarted) {
-          room.players = room.players.filter((p) => p.id !== currentPlayerId);
-          if (room.players.length === 0) {
-            rooms.delete(currentRoomCode);
-            console.log(`[WS] Room ${currentRoomCode} cleaned up after disconnect.`);
-          } else {
-            if (room.hostId === currentPlayerId) {
-              room.hostId = room.players[0].id;
-              room.players[0].isCreator = true;
+        if (room) {
+          if (!room.gameStarted) {
+            // Before game start: Remove player from lobby
+            room.players = room.players.filter((p) => p.id !== currentPlayerId);
+            if (room.players.length === 0) {
+              rooms.delete(currentRoomCode);
+              console.log(`[WS] Room ${currentRoomCode} cleaned up after disconnect.`);
+            } else {
+              if (room.hostId === currentPlayerId) {
+                room.hostId = room.players[0].id;
+                room.players[0].isCreator = true;
+              }
+              const sanitized = getSanitizedRoom(room);
+              broadcastToRoom(room, {
+                type: "ROOM_UPDATED",
+                room: sanitized,
+              });
             }
-            const sanitized = getSanitizedRoom(room);
-            broadcastToRoom(room, {
-              type: "ROOM_UPDATED",
-              room: sanitized,
-            });
+          } else {
+            // After game start: Mark player as offline so their pawns remain and turn is auto-skipped
+            const p = room.players.find((player) => player.id === currentPlayerId);
+            if (p) {
+              p.isOffline = true;
+              const sanitized = getSanitizedRoom(room);
+              broadcastToRoom(room, {
+                type: "ROOM_UPDATED",
+                room: sanitized,
+              });
+              broadcastToRoom(room, {
+                type: "PLAYER_OFFLINE",
+                playerId: p.id,
+                color: p.color,
+                name: p.name,
+                room: sanitized,
+              });
+              console.log(`[WS] Player ${p.name} (${currentPlayerId}) marked OFFLINE in room ${currentRoomCode}.`);
+            }
           }
         }
       }
