@@ -19,6 +19,7 @@ export interface RoomPlayer {
   avatar?: string;
   color: PlayerColor;
   isCreator: boolean;
+  isBot?: boolean;
   ws?: WebSocket;
   isAlive?: boolean;
 }
@@ -32,6 +33,7 @@ export interface SignalingRoom {
     surname?: string;
     avatar?: string;
     isCreator: boolean;
+    isBot?: boolean;
   }[];
   isTeamUpMode: boolean;
   isHomeEntryLockEnabled: boolean;
@@ -54,8 +56,147 @@ interface RoomData {
 // In-Memory Room Store
 const rooms = new Map<string, RoomData>();
 
-// Color assignment order: 1st=RED, 2nd=GREEN, 3rd=YELLOW, 4th=BLUE
-const COLOR_ORDER: PlayerColor[] = ["RED", "GREEN", "YELLOW", "BLUE"];
+// --- GLOBAL AUTO MATCHMAKING QUEUE (60 SECONDS TIMEOUT) ---
+interface QueuePlayer {
+  ws: WebSocket;
+  playerId: string;
+  playerName: string;
+  playerSurname?: string;
+  playerAvatar?: string;
+  joinedAt: number;
+}
+
+let activeQueue: QueuePlayer[] = [];
+let matchmakingTimerInterval: NodeJS.Timeout | null = null;
+let matchmakingCountdown = 60;
+const MATCHMAKING_TIMEOUT = 60;
+
+function broadcastQueueUpdate() {
+  const payload = JSON.stringify({
+    type: "QUEUE_UPDATE",
+    count: activeQueue.length,
+    timeLeft: matchmakingCountdown,
+    totalTime: MATCHMAKING_TIMEOUT,
+  });
+  for (const qp of activeQueue) {
+    if (qp.ws && qp.ws.readyState === WebSocket.OPEN) {
+      try {
+        qp.ws.send(payload);
+      } catch (err) {
+        console.error("[WS] Error sending queue update:", err);
+      }
+    }
+  }
+}
+
+function launchAutoMatch(batch: QueuePlayer[]) {
+  if (batch.length === 0) return;
+
+  const roomCode = generateRoomCode();
+  const colors: PlayerColor[] = ["RED", "GREEN", "YELLOW", "BLUE"];
+  const roomPlayers: RoomPlayer[] = [];
+
+  // Add real players from queue batch
+  batch.forEach((qp, idx) => {
+    roomPlayers.push({
+      id: qp.playerId,
+      name: qp.playerName || `Player ${idx + 1}`,
+      surname: qp.playerSurname || "",
+      avatar: qp.playerAvatar || "",
+      color: colors[idx],
+      isCreator: idx === 0,
+      isBot: false,
+      ws: qp.ws,
+    });
+  });
+
+  // Fill remaining empty slots up to 4 with AI Bots
+  const realCount = batch.length;
+  const botNames: Record<PlayerColor, string> = {
+    RED: "Bot Red",
+    GREEN: "Bot Green",
+    YELLOW: "Bot Yellow",
+    BLUE: "Bot Blue",
+  };
+
+  for (let i = realCount; i < 4; i++) {
+    const botColor = colors[i];
+    roomPlayers.push({
+      id: `bot_${botColor.toLowerCase()}_${Date.now()}_${Math.floor(Math.random() * 8999 + 1000)}`,
+      name: botNames[botColor],
+      surname: "AI",
+      avatar: "",
+      color: botColor,
+      isCreator: false,
+      isBot: true,
+    });
+  }
+
+  const newRoom: RoomData = {
+    code: roomCode,
+    hostId: roomPlayers[0].id,
+    players: roomPlayers,
+    isTeamUpMode: false,
+    isHomeEntryLockEnabled: true,
+    isTokenBlockEnabled: false,
+    gameStarted: true,
+    createdAt: Date.now(),
+  };
+
+  rooms.set(roomCode, newRoom);
+  console.log(`[WS] Auto Match Launched in Room ${roomCode}! Real players: ${realCount}, Bots: ${4 - realCount}`);
+
+  const sanitized = getSanitizedRoom(newRoom);
+  broadcastToRoom(newRoom, {
+    type: "GAME_STARTED",
+    room: sanitized,
+    isAutoMatch: true,
+    realCount,
+  });
+}
+
+function startMatchmakingTimer() {
+  if (matchmakingTimerInterval) return;
+  matchmakingCountdown = MATCHMAKING_TIMEOUT;
+  broadcastQueueUpdate();
+
+  matchmakingTimerInterval = setInterval(() => {
+    matchmakingCountdown -= 1;
+    broadcastQueueUpdate();
+
+    if (matchmakingCountdown <= 0) {
+      if (matchmakingTimerInterval) {
+        clearInterval(matchmakingTimerInterval);
+        matchmakingTimerInterval = null;
+      }
+
+      // 60 seconds finished -> Take up to 4 available players, fill rest with Bots, start match!
+      if (activeQueue.length > 0) {
+        const batch = activeQueue.splice(0, 4);
+        launchAutoMatch(batch);
+      }
+
+      // If more players are still in queue (e.g. 5th player), restart timer for next batch
+      if (activeQueue.length > 0) {
+        startMatchmakingTimer();
+      } else {
+        matchmakingCountdown = MATCHMAKING_TIMEOUT;
+      }
+    }
+  }, 1000);
+}
+
+function stopMatchmakingTimerIfEmpty() {
+  if (activeQueue.length === 0 && matchmakingTimerInterval) {
+    clearInterval(matchmakingTimerInterval);
+    matchmakingTimerInterval = null;
+    matchmakingCountdown = MATCHMAKING_TIMEOUT;
+  }
+}
+
+// Color assignment order: 1st=RED, 2nd=YELLOW (for 2-players opposite start), 3rd=GREEN, 4th=BLUE
+const COLOR_ORDER_2_PLAYERS: PlayerColor[] = ["RED", "YELLOW"];
+const COLOR_ORDER_DEFAULT: PlayerColor[] = ["RED", "GREEN", "YELLOW", "BLUE"];
 
 function generateRoomCode(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -79,6 +220,7 @@ function getSanitizedRoom(room: RoomData): SignalingRoom {
       surname: p.surname,
       avatar: p.avatar,
       isCreator: p.isCreator,
+      isBot: Boolean(p.isBot),
     })),
     isTeamUpMode: room.isTeamUpMode,
     isHomeEntryLockEnabled: room.isHomeEntryLockEnabled,
@@ -194,7 +336,63 @@ async function startServer() {
           return;
         }
 
-        // 1. CREATE_ROOM
+        // 1. JOIN_AUTO_QUEUE / join_auto_queue (Global 4-Player Matchmaking Queue)
+        if (type === "JOIN_AUTO_QUEUE" || type === "join_auto_queue") {
+          const { playerId, playerName, playerSurname, playerAvatar } = data;
+          if (!playerId) {
+            ws.send(JSON.stringify({ type: "ERROR", message: "Invalid player ID" }));
+            return;
+          }
+
+          // Remove any existing entry for this player / socket first to prevent duplicates
+          activeQueue = activeQueue.filter((qp) => qp.playerId !== playerId && qp.ws !== ws);
+
+          const queuePlayer: QueuePlayer = {
+            ws,
+            playerId,
+            playerName: playerName || `Player`,
+            playerSurname: playerSurname || "",
+            playerAvatar: playerAvatar || "",
+            joinedAt: Date.now(),
+          };
+
+          activeQueue.push(queuePlayer);
+          currentPlayerId = playerId;
+          console.log(`[WS] Player ${queuePlayer.playerName} (${playerId}) joined Global Auto Queue. Total queued: ${activeQueue.length}`);
+
+          // Condition A: If 4 real players join, immediately launch 4-player real match!
+          if (activeQueue.length >= 4) {
+            const batch = activeQueue.splice(0, 4);
+            launchAutoMatch(batch);
+            if (activeQueue.length === 0) {
+              if (matchmakingTimerInterval) {
+                clearInterval(matchmakingTimerInterval);
+                matchmakingTimerInterval = null;
+                matchmakingCountdown = MATCHMAKING_TIMEOUT;
+              }
+            } else {
+              matchmakingCountdown = MATCHMAKING_TIMEOUT;
+              broadcastQueueUpdate();
+            }
+          } else {
+            // Start 60-second countdown timer if not already running
+            startMatchmakingTimer();
+            broadcastQueueUpdate();
+          }
+          return;
+        }
+
+        // 2. LEAVE_AUTO_QUEUE / leave_auto_queue
+        if (type === "LEAVE_AUTO_QUEUE" || type === "leave_auto_queue") {
+          const { playerId } = data;
+          activeQueue = activeQueue.filter((qp) => qp.ws !== ws && (!playerId || qp.playerId !== playerId));
+          console.log(`[WS] Player left Global Auto Queue. Remaining: ${activeQueue.length}`);
+          stopMatchmakingTimerIfEmpty();
+          broadcastQueueUpdate();
+          return;
+        }
+
+        // 3. CREATE_ROOM
         if (type === "CREATE_ROOM") {
           const {
             playerId,
@@ -297,9 +495,24 @@ async function startServer() {
             return;
           }
 
-          // Assign next available color from COLOR_ORDER
-          const takenColors = room.players.map((p) => p.color);
-          const availableColor = COLOR_ORDER.find((c) => !takenColors.includes(c)) || "GREEN";
+          // Color Assignment Logic based on Player Count:
+          // If 2 players: 1st=RED, 2nd=YELLOW (Opposite corners)
+          // If 3 players: 1st=RED, 2nd=GREEN, 3rd=YELLOW
+          // If 4 players: 1st=RED, 2nd=GREEN, 3rd=YELLOW, 4th=BLUE
+          let availableColor: PlayerColor = "YELLOW";
+          if (room.players.length === 1) {
+            availableColor = "YELLOW";
+          } else if (room.players.length === 2) {
+            // Re-align player 2 to GREEN and assign YELLOW to player 3 for standard 3-player match
+            room.players[0].color = "RED";
+            room.players[1].color = "GREEN";
+            availableColor = "YELLOW";
+          } else if (room.players.length === 3) {
+            availableColor = "BLUE";
+          } else {
+            const takenColors = room.players.map((p) => p.color);
+            availableColor = COLOR_ORDER_DEFAULT.find((c) => !takenColors.includes(c)) || "GREEN";
+          }
 
           const newPlayer: RoomPlayer = {
             id: playerId,
@@ -388,6 +601,24 @@ async function startServer() {
             return;
           }
 
+          // Strictly enforce player colors based on count:
+          // 2 Players -> RED & YELLOW (Opposite start positions across the board)
+          // 3 Players -> RED, GREEN, YELLOW
+          // 4 Players -> RED, GREEN, YELLOW, BLUE
+          if (room.players.length === 2) {
+            room.players[0].color = "RED";
+            room.players[1].color = "YELLOW";
+          } else if (room.players.length === 3) {
+            room.players[0].color = "RED";
+            room.players[1].color = "GREEN";
+            room.players[2].color = "YELLOW";
+          } else if (room.players.length >= 4) {
+            room.players[0].color = "RED";
+            room.players[1].color = "GREEN";
+            room.players[2].color = "YELLOW";
+            room.players[3].color = "BLUE";
+          }
+
           room.gameStarted = true;
           const sanitized = getSanitizedRoom(room);
 
@@ -400,7 +631,17 @@ async function startServer() {
           return;
         }
 
-        // 6. LEAVE_ROOM
+        // 7. SYNC_GAME_STATE / GAME_ACTION (Live state synchronization for online room matches)
+        if (type === "SYNC_GAME_STATE" || type === "GAME_ACTION") {
+          const { roomCode } = data;
+          if (!roomCode) return;
+          const room = rooms.get(roomCode.toUpperCase());
+          if (!room) return;
+          broadcastToRoom(room, data);
+          return;
+        }
+
+        // 8. LEAVE_ROOM
         if (type === "LEAVE_ROOM") {
           if (currentRoomCode && currentPlayerId) {
             const room = rooms.get(currentRoomCode);
@@ -432,6 +673,15 @@ async function startServer() {
     });
 
     ws.on("close", () => {
+      // 1. Remove from global auto matchmaking queue if present
+      const wasInQueue = activeQueue.some((qp) => qp.ws === ws);
+      if (wasInQueue) {
+        activeQueue = activeQueue.filter((qp) => qp.ws !== ws);
+        stopMatchmakingTimerIfEmpty();
+        broadcastQueueUpdate();
+      }
+
+      // 2. Remove from private room if game not started
       if (currentRoomCode && currentPlayerId) {
         const room = rooms.get(currentRoomCode);
         if (room && !room.gameStarted) {
