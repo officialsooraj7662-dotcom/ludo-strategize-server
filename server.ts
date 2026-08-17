@@ -47,6 +47,24 @@ export interface SignalingRoom {
   createdAt: number;
 }
 
+export interface GameActionPacket {
+  seq: number;
+  type: string;
+  roomCode: string;
+  playerId?: string;
+  color?: PlayerColor;
+  rollValue?: number;
+  tokenId?: number;
+  forceDiceValue?: number;
+  lastActionSequenceId?: number;
+  gameState?: any;
+  missingSeqs?: number[];
+  packets?: GameActionPacket[];
+  nextActiveIndex?: number;
+  isOffline?: boolean;
+  timestamp?: number;
+}
+
 interface RoomData {
   code: string;
   hostId: string;
@@ -58,10 +76,152 @@ interface RoomData {
   gameState?: any;
   winnerColor?: string | null;
   createdAt: number;
+  currentSeq: number;
+  actionRingBuffer: GameActionPacket[];
+  activePlayerIndex: number;
+  turnTimer10?: NodeJS.Timeout | null;
+  turnTimer20?: NodeJS.Timeout | null;
+  turnTimer23?: NodeJS.Timeout | null;
+  playerMissedTurns: Map<string, number>;
 }
 
 // In-Memory Room Store
 const rooms = new Map<string, RoomData>();
+
+// --- RING BUFFER & RELAY TIMEOUT HELPERS ---
+function pushActionToRingBuffer(room: RoomData, packet: any) {
+  if (!room.actionRingBuffer) {
+    room.actionRingBuffer = [];
+  }
+  room.actionRingBuffer.push(packet);
+  if (room.actionRingBuffer.length > 10) {
+    room.actionRingBuffer.shift(); // Keep only the latest 10 sequential packets
+  }
+}
+
+function clearRoomTurnTimer(room: RoomData) {
+  if (room.turnTimer10) {
+    clearTimeout(room.turnTimer10);
+    room.turnTimer10 = null;
+  }
+  if (room.turnTimer20) {
+    clearTimeout(room.turnTimer20);
+    room.turnTimer20 = null;
+  }
+  if (room.turnTimer23) {
+    clearTimeout(room.turnTimer23);
+    room.turnTimer23 = null;
+  }
+}
+
+function startRoomTurnTimer(room: RoomData) {
+  clearRoomTurnTimer(room);
+  if (!room.gameStarted || room.winnerColor) return;
+
+  const activeIndex = room.activePlayerIndex ?? 0;
+  const activePlayer = room.players[activeIndex];
+  if (!activePlayer) return;
+
+  const isOffline = activePlayer.isOffline || activePlayer.hasQuit;
+
+  if (isOffline) {
+    // Fast 1s auto-skip for Offline/Quit players
+    room.turnTimer23 = setTimeout(() => {
+      advanceRoomTurnOnTimeout(room, activePlayer, true);
+    }, 1000);
+    return;
+  }
+
+  // 10s Silent Ping Check
+  room.turnTimer10 = setTimeout(() => {
+    if (activePlayer.ws && activePlayer.ws.readyState === WebSocket.OPEN) {
+      try {
+        activePlayer.ws.send(
+          JSON.stringify({
+            type: "TURN_PING",
+            seq: room.currentSeq,
+            timeElapsed: 10,
+          })
+        );
+      } catch (err) {}
+    }
+  }, 10000);
+
+  // 20s Warning Ping Check
+  room.turnTimer20 = setTimeout(() => {
+    if (activePlayer.ws && activePlayer.ws.readyState === WebSocket.OPEN) {
+      try {
+        activePlayer.ws.send(
+          JSON.stringify({
+            type: "TURN_PING",
+            seq: room.currentSeq,
+            timeElapsed: 20,
+          })
+        );
+      } catch (err) {}
+    }
+  }, 20000);
+
+  // 23s Authoritative Server Skip Buffer (20s client + 3s network grace margin)
+  room.turnTimer23 = setTimeout(() => {
+    advanceRoomTurnOnTimeout(room, activePlayer, false);
+  }, 23000);
+}
+
+function advanceRoomTurnOnTimeout(room: RoomData, activePlayer: RoomPlayer, isAlreadyOffline: boolean) {
+  clearRoomTurnTimer(room);
+  if (!room.gameStarted || room.winnerColor) return;
+
+  if (!isAlreadyOffline) {
+    const currentMisses = (room.playerMissedTurns.get(activePlayer.id) || 0) + 1;
+    room.playerMissedTurns.set(activePlayer.id, currentMisses);
+
+    if (currentMisses >= 3) {
+      activePlayer.isOffline = true;
+      const sanitized = getSanitizedRoom(room);
+      broadcastToRoom(room, {
+        type: "PLAYER_OFFLINE",
+        playerId: activePlayer.id,
+        color: activePlayer.color,
+        name: activePlayer.name,
+        room: sanitized,
+      });
+      console.log(`[WS] Player ${activePlayer.name} marked OFFLINE after 3 missed turn strikes in room ${room.code}`);
+    }
+  }
+
+  // Find next active player (skip quit players)
+  let nextIndex = (room.activePlayerIndex + 1) % room.players.length;
+  let attempts = 0;
+  while (attempts < room.players.length) {
+    const candidate = room.players[nextIndex];
+    if (candidate && !candidate.hasQuit) {
+      break;
+    }
+    nextIndex = (nextIndex + 1) % room.players.length;
+    attempts++;
+  }
+
+  room.activePlayerIndex = nextIndex;
+  room.currentSeq = (room.currentSeq || 0) + 1;
+
+  const skipPacket: GameActionPacket = {
+    seq: room.currentSeq,
+    type: "TURN_TIMEOUT_SKIP",
+    roomCode: room.code,
+    playerId: activePlayer.id,
+    color: activePlayer.color,
+    nextActiveIndex: nextIndex,
+    isOffline: activePlayer.isOffline,
+    timestamp: Date.now(),
+  };
+
+  pushActionToRingBuffer(room, skipPacket);
+  broadcastToRoom(room, skipPacket);
+
+  // Start timer for the next active player
+  startRoomTurnTimer(room);
+}
 
 // 40 realistic English names for opponents in online matchmaking
 const OPPONENT_NAMES = [
@@ -130,42 +290,60 @@ function broadcastQueueUpdate() {
 function launchAutoMatch(batch: QueuePlayer[]) {
   if (batch.length === 0) return;
 
-  const roomCode = generateRoomCode();
-  const colors: PlayerColor[] = ["RED", "GREEN", "YELLOW", "BLUE"];
-  const roomPlayers: RoomPlayer[] = [];
+  // Case 1: 1 Player Only (60s timer elapsed with no real opponent)
+  // ZERO SERVER LOAD CLIENT-SIDE BOT: No room created, no socket timers, no server state syncing.
+  if (batch.length === 1) {
+    const singlePlayer = batch[0];
+    const assignedOpponentNames = getRandomOpponentNames(1, [singlePlayer.playerName]);
+    const opponentName = assignedOpponentNames[0] || "Oliver";
 
-  // Add real players from queue batch
-  batch.forEach((qp, idx) => {
-    roomPlayers.push({
-      id: qp.playerId,
-      name: qp.playerName || `Player ${idx + 1}`,
-      surname: qp.playerSurname || "",
-      avatar: qp.playerAvatar || "",
-      color: colors[idx],
-      isCreator: idx === 0,
-      isBot: false,
-      ws: qp.ws,
-    });
-  });
-
-  // Fill remaining empty slots up to 4 with unique random realistic player names
-  const realCount = batch.length;
-  const realPlayerNames = batch.map((qp) => qp.playerName || "");
-  const assignedOpponentNames = getRandomOpponentNames(4 - realCount, realPlayerNames);
-
-  for (let i = realCount; i < 4; i++) {
-    const slotColor = colors[i];
-    const opponentName = assignedOpponentNames[i - realCount] || `Player ${i + 1}`;
-    roomPlayers.push({
-      id: `player_${slotColor.toLowerCase()}_${Date.now()}_${Math.floor(Math.random() * 8999 + 1000)}`,
-      name: opponentName,
-      surname: "",
-      avatar: "",
-      color: slotColor,
-      isCreator: false,
-      isBot: true,
-    });
+    if (singlePlayer.ws && singlePlayer.ws.readyState === WebSocket.OPEN) {
+      try {
+        singlePlayer.ws.send(
+          JSON.stringify({
+            type: "START_LOCAL_VIRTUAL_MATCH",
+            yourColor: "RED",
+            opponent: {
+              name: opponentName,
+              color: "YELLOW",
+              avatar: "",
+            },
+          })
+        );
+      } catch (err) {
+        console.error("[WS] Error sending START_LOCAL_VIRTUAL_MATCH:", err);
+      }
+    }
+    console.log(`[WS] 60s timeout for single player ${singlePlayer.playerName}. Started 100% Client-Side Local Simulation. Zero Server Load!`);
+    return;
   }
+
+  // Case 2: 2, 3, or 4 Real Players Found!
+  // Start 100% Real Online Multiplayer Game with strictly real players - ZERO BOTS ADDED!
+  const realCount = batch.length;
+  const roomCode = generateRoomCode();
+
+  // Color assignments:
+  // 2 players -> RED, YELLOW (opposite corners for classic 2-player board)
+  // 3 players -> RED, GREEN, YELLOW
+  // 4 players -> RED, GREEN, YELLOW, BLUE
+  let assignedColors: PlayerColor[] = COLOR_ORDER_2_PLAYERS;
+  if (realCount === 3) {
+    assignedColors = COLOR_ORDER_3_PLAYERS;
+  } else if (realCount >= 4) {
+    assignedColors = COLOR_ORDER_4_PLAYERS;
+  }
+
+  const roomPlayers: RoomPlayer[] = batch.map((qp, idx) => ({
+    id: qp.playerId,
+    name: qp.playerName || `Player ${idx + 1}`,
+    surname: qp.playerSurname || "",
+    avatar: qp.playerAvatar || "",
+    color: assignedColors[idx],
+    isCreator: idx === 0,
+    isBot: false,
+    ws: qp.ws,
+  }));
 
   const newRoom: RoomData = {
     code: roomCode,
@@ -176,10 +354,14 @@ function launchAutoMatch(batch: QueuePlayer[]) {
     isTokenBlockEnabled: false,
     gameStarted: true,
     createdAt: Date.now(),
+    currentSeq: 0,
+    actionRingBuffer: [],
+    activePlayerIndex: 0,
+    playerMissedTurns: new Map(),
   };
 
   rooms.set(roomCode, newRoom);
-  console.log(`[WS] Auto Match Launched in Room ${roomCode}! Total players: ${roomPlayers.length} (Real: ${realCount}, Matched: ${4 - realCount})`);
+  console.log(`[WS] Real Online Multiplayer Match Launched in Room ${roomCode}! Total real players: ${realCount} (Zero Bots)`);
 
   const sanitized = getSanitizedRoom(newRoom);
   broadcastToRoom(newRoom, {
@@ -188,6 +370,9 @@ function launchAutoMatch(batch: QueuePlayer[]) {
     isAutoMatch: true,
     realCount,
   });
+
+  // Start turn timer for first active player
+  startRoomTurnTimer(newRoom);
 }
 
 function startMatchmakingTimer() {
@@ -205,7 +390,7 @@ function startMatchmakingTimer() {
         matchmakingTimerInterval = null;
       }
 
-      // 60 seconds finished -> Take up to 4 available players, fill rest with Bots, start match!
+      // 60 seconds finished -> Launch match with available real players (2/3 players = no bots; 1 player = 1v1 Play with Bot)
       if (activeQueue.length > 0) {
         const batch = activeQueue.splice(0, 4);
         launchAutoMatch(batch);
@@ -229,9 +414,10 @@ function stopMatchmakingTimerIfEmpty() {
   }
 }
 
-// Color assignment order: 1st=RED, 2nd=YELLOW (for 2-players opposite start), 3rd=GREEN, 4th=BLUE
+// Color assignment constants
 const COLOR_ORDER_2_PLAYERS: PlayerColor[] = ["RED", "YELLOW"];
-const COLOR_ORDER_DEFAULT: PlayerColor[] = ["RED", "GREEN", "YELLOW", "BLUE"];
+const COLOR_ORDER_3_PLAYERS: PlayerColor[] = ["RED", "GREEN", "YELLOW"];
+const COLOR_ORDER_4_PLAYERS: PlayerColor[] = ["RED", "GREEN", "YELLOW", "BLUE"];
 
 function generateRoomCode(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -298,8 +484,8 @@ async function startServer() {
 
   app.use(express.json());
 
-  // Root Server Info
-  app.get("/", (_req, res) => {
+  // Server Info endpoint
+  app.get("/api/info", (_req, res) => {
     res.json({
       service: "Ludo Multiplayer Live Server",
       status: "running",
@@ -487,6 +673,10 @@ async function startServer() {
             isTokenBlockEnabled: Boolean(isTokenBlockEnabled),
             gameStarted: false,
             createdAt: Date.now(),
+            currentSeq: 0,
+            actionRingBuffer: [],
+            activePlayerIndex: 0,
+            playerMissedTurns: new Map(),
           };
 
           rooms.set(code, newRoom);
@@ -572,7 +762,7 @@ async function startServer() {
             availableColor = "BLUE";
           } else {
             const takenColors = room.players.map((p) => p.color);
-            availableColor = COLOR_ORDER_DEFAULT.find((c) => !takenColors.includes(c)) || "GREEN";
+            availableColor = COLOR_ORDER_4_PLAYERS.find((c) => !takenColors.includes(c)) || "GREEN";
           }
 
           const newPlayer: RoomPlayer = {
@@ -681,6 +871,11 @@ async function startServer() {
           }
 
           room.gameStarted = true;
+          room.currentSeq = 0;
+          room.actionRingBuffer = [];
+          room.activePlayerIndex = 0;
+          room.playerMissedTurns = new Map();
+
           const sanitized = getSanitizedRoom(room);
 
           console.log(`[WS] Game STARTING in room ${room.code} with ${room.players.length} players!`);
@@ -689,6 +884,9 @@ async function startServer() {
             type: "GAME_STARTED",
             room: sanitized,
           });
+
+          // Start authoritative 23s turn timer for the initial active player
+          startRoomTurnTimer(room);
           return;
         }
 
@@ -801,19 +999,70 @@ async function startServer() {
           return;
         }
 
-        // 9. SYNC_GAME_STATE / GAME_ACTION (Live state synchronization for online room matches)
-        if (type === "SYNC_GAME_STATE" || type === "GAME_ACTION") {
-          const { roomCode, gameState } = data;
+        // 9. EVENT-BASED RELAY ARCHITECTURE: ROLL_DICE, MOVE_PAWN, FULL_BOARD_STATE, SYNC_GAME_STATE, GAME_ACTION
+        if (
+          type === "ROLL_DICE" ||
+          type === "MOVE_PAWN" ||
+          type === "FULL_BOARD_STATE" ||
+          type === "SYNC_GAME_STATE" ||
+          type === "GAME_ACTION"
+        ) {
+          const { roomCode, playerId, gameState, seq } = data;
           if (!roomCode) return;
           const room = rooms.get(roomCode.toUpperCase());
           if (!room) return;
+
+          // Reset missed turn strikes for active player on action
+          if (playerId) {
+            room.playerMissedTurns.set(playerId, 0);
+          }
+
+          // Monotonic sequence numbering
+          if (typeof seq === "number" && seq > (room.currentSeq || 0)) {
+            room.currentSeq = seq;
+          } else if (!data.seq) {
+            data.seq = ++room.currentSeq;
+          }
+
+          data.timestamp = Date.now();
+
+          // If gameState is provided, update room cache
           if (gameState) {
             room.gameState = gameState;
             if (gameState.winnerColor) {
               room.winnerColor = gameState.winnerColor;
+              clearRoomTurnTimer(room);
+            } else if (typeof gameState.activePlayerIndex === "number") {
+              if (gameState.activePlayerIndex !== room.activePlayerIndex) {
+                room.activePlayerIndex = gameState.activePlayerIndex;
+                startRoomTurnTimer(room);
+              }
             }
           }
+
+          // Push into 10-packet circular ring buffer
+          pushActionToRingBuffer(room, data);
+
+          // Relay action packet to all clients in the room
           broadcastToRoom(room, data);
+          return;
+        }
+
+        // 10. FETCH_SEQ / RESEND_SEQ (Retransmission handler for missing packets)
+        if (type === "FETCH_SEQ" || type === "fetch_seq") {
+          const { roomCode, missingSeqs } = data;
+          if (!roomCode || !Array.isArray(missingSeqs)) return;
+          const room = rooms.get(roomCode.toUpperCase());
+          if (!room) return;
+
+          const foundPackets = (room.actionRingBuffer || []).filter((p) => missingSeqs.includes(p.seq));
+          ws.send(
+            JSON.stringify({
+              type: "RESEND_SEQ",
+              roomCode,
+              packets: foundPackets,
+            })
+          );
           return;
         }
 
