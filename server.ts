@@ -200,7 +200,7 @@ function handlePlayerDisconnectOrForfeit(room: RoomData, playerId: string, isPer
   // Count remaining active (not quit and not offline) players
   const activePlayers = room.players.filter((pl) => !pl.hasQuit && !pl.isOffline);
 
-  // If only 1 player remains active in the game (e.g. in 2-player match or when all other players left/offline)
+  // RULE: Winner is declared ONLY when exactly 1 active player remains in the match
   if (activePlayers.length === 1) {
     const winnerPlayer = activePlayers[0];
     room.winnerColor = winnerPlayer.color;
@@ -234,7 +234,7 @@ function handlePlayerDisconnectOrForfeit(room: RoomData, playerId: string, isPer
 
     room.currentSeq = (room.currentSeq || 0) + 1;
 
-    console.log(`[WS] 🏆 WINNER DECLARED in Room ${room.code}: ${winnerPlayer.name} (${winnerPlayer.color}). Opponent left the match!`);
+    console.log(`[WS] 🏆 WINNER DECLARED in Room ${room.code}: ${winnerPlayer.name} (${winnerPlayer.color}). Only 1 active player remaining!`);
 
     // 1. Send WINNER_DECLARED to the remaining player
     broadcastToRoom(room, {
@@ -262,7 +262,6 @@ function handlePlayerDisconnectOrForfeit(room: RoomData, playerId: string, isPer
     });
 
     // 4. Server Room Deletion strictly AFTER Winner Declaration:
-    // Give 5000ms so the winner's client receives all packets, displays victory celebration, and then server cleans up room
     setTimeout(() => {
       if (rooms.has(room.code)) {
         clearRoomTurnTimer(room);
@@ -275,6 +274,14 @@ function handlePlayerDisconnectOrForfeit(room: RoomData, playerId: string, isPer
     clearRoomTurnTimer(room);
     rooms.delete(room.code);
     console.log(`[WS] 🗑️ Room ${room.code} deleted (all players left/offline).`);
+  } else {
+    // 2 or more active players remain in match! Match continues seamlessly!
+    // If the player who just left/went offline was the current active player, immediately advance turn to next active player
+    const currentActivePlayer = room.players[room.activePlayerIndex];
+    if (currentActivePlayer && currentActivePlayer.id === playerId) {
+      clearRoomTurnTimer(room);
+      advanceRoomTurnOnTimeout(room, currentActivePlayer, true);
+    }
   }
 }
 
