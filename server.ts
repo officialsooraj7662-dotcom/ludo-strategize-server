@@ -16,7 +16,6 @@ export interface RoomPlayer {
   id: string;
   name: string;
   surname?: string;
-  avatar?: string;
   color: PlayerColor;
   isCreator: boolean;
   isBot?: boolean;
@@ -33,7 +32,6 @@ export interface SignalingRoom {
     color: PlayerColor;
     name: string;
     surname?: string;
-    avatar?: string;
     isCreator: boolean;
     isBot?: boolean;
     isOffline?: boolean;
@@ -190,8 +188,6 @@ function handlePlayerDisconnectOrForfeit(room: RoomData, playerId: string, isPer
     room: sanitized,
   });
 
-  console.log(`[WS] Player ${p.name} (${playerId}) marked ${isPermanentLeave ? 'QUIT/FORFEIT' : 'OFFLINE'} in room ${room.code}`);
-
   // Check if game has started and winner is not already declared
   if (!room.gameStarted || room.winnerColor) {
     return;
@@ -234,8 +230,6 @@ function handlePlayerDisconnectOrForfeit(room: RoomData, playerId: string, isPer
 
     room.currentSeq = (room.currentSeq || 0) + 1;
 
-    console.log(`[WS] 🏆 WINNER DECLARED in Room ${room.code}: ${winnerPlayer.name} (${winnerPlayer.color}). Only 1 active player remaining!`);
-
     // 1. Send WINNER_DECLARED to the remaining player
     broadcastToRoom(room, {
       type: "WINNER_DECLARED",
@@ -266,14 +260,12 @@ function handlePlayerDisconnectOrForfeit(room: RoomData, playerId: string, isPer
       if (rooms.has(room.code)) {
         clearRoomTurnTimer(room);
         rooms.delete(room.code);
-        console.log(`[WS] 🗑️ Room ${room.code} permanently deleted from server memory after winner was declared.`);
       }
     }, 5000);
   } else if (activePlayers.length === 0) {
     // All players left -> delete room immediately
     clearRoomTurnTimer(room);
     rooms.delete(room.code);
-    console.log(`[WS] 🗑️ Room ${room.code} deleted (all players left/offline).`);
   } else {
     // 2 or more active players remain in match! Match continues seamlessly!
     // If the player who just left/went offline was the current active player, immediately advance turn to next active player
@@ -363,7 +355,6 @@ interface QueuePlayer {
   playerId: string;
   playerName: string;
   playerSurname?: string;
-  playerAvatar?: string;
   joinedAt: number;
 }
 
@@ -382,7 +373,6 @@ function broadcastQueueUpdate() {
       id: qp.playerId,
       name: qp.playerName || `Player ${idx + 1}`,
       surname: qp.playerSurname || "",
-      avatar: qp.playerAvatar || "",
     })),
   });
   for (const qp of activeQueue) {
@@ -415,7 +405,6 @@ function launchAutoMatch(batch: QueuePlayer[]) {
             opponent: {
               name: opponentName,
               color: "YELLOW",
-              avatar: "",
             },
           })
         );
@@ -423,7 +412,6 @@ function launchAutoMatch(batch: QueuePlayer[]) {
         console.error("[WS] Error sending START_LOCAL_VIRTUAL_MATCH:", err);
       }
     }
-    console.log(`[WS] 60s timeout for single player ${singlePlayer.playerName}. Started 100% Client-Side Local Simulation. Zero Server Load!`);
     return;
   }
 
@@ -447,7 +435,6 @@ function launchAutoMatch(batch: QueuePlayer[]) {
     id: qp.playerId,
     name: qp.playerName || `Player ${idx + 1}`,
     surname: qp.playerSurname || "",
-    avatar: qp.playerAvatar || "",
     color: assignedColors[idx],
     isCreator: idx === 0,
     isBot: false,
@@ -470,7 +457,6 @@ function launchAutoMatch(batch: QueuePlayer[]) {
   };
 
   rooms.set(roomCode, newRoom);
-  console.log(`[WS] Real Online Multiplayer Match Launched in Room ${roomCode}! Total real players: ${realCount} (Zero Bots)`);
 
   const sanitized = getSanitizedRoom(newRoom);
   broadcastToRoom(newRoom, {
@@ -548,7 +534,6 @@ function getSanitizedRoom(room: RoomData): SignalingRoom {
       color: p.color,
       name: p.name,
       surname: p.surname,
-      avatar: p.avatar,
       isCreator: p.isCreator,
       isBot: Boolean(p.isBot),
       isOffline: Boolean(p.isOffline),
@@ -613,9 +598,11 @@ async function startServer() {
   app.get("/api/app-version", (_req, res) => {
     res.json({
       latestVersion: "1.0.0",
+      minSupportedVersion: "1.0.0",
       minRequiredVersion: "1.0.0",
-      playStoreUrl: "https://play.google.com/store/apps/details?id=com.gamers.ludo",
-      appStoreUrl: "https://apps.apple.com/app/id123456789",
+      playStoreUrl: "https://play.google.com/store/apps/details?id=com.ludostrategize.game",
+      appStoreUrl: "https://apps.apple.com/app/ludo-game/id123456789",
+      releaseNotes: "Optimized online multiplayer and security enhancements",
     });
   });
 
@@ -663,7 +650,6 @@ async function startServer() {
       const p = room.players.find((player) => player.id === playerId);
       if (p) {
         handlePlayerDisconnectOrForfeit(room, playerId, true);
-        console.log(`[REST] Player ${p.name} (${playerId}) marked left/forfeit from room ${code}`);
       }
     }
     return res.json({ success: true });
@@ -711,7 +697,7 @@ async function startServer() {
 
         // 1. JOIN_AUTO_QUEUE / join_auto_queue (Global 4-Player Matchmaking Queue)
         if (type === "JOIN_AUTO_QUEUE" || type === "join_auto_queue") {
-          const { playerId, playerName, playerSurname, playerAvatar } = data;
+          const { playerId, playerName, playerSurname } = data;
           if (!playerId) {
             ws.send(JSON.stringify({ type: "ERROR", message: "Invalid player ID" }));
             return;
@@ -725,13 +711,11 @@ async function startServer() {
             playerId,
             playerName: playerName || `Player`,
             playerSurname: playerSurname || "",
-            playerAvatar: playerAvatar || "",
             joinedAt: Date.now(),
           };
 
           activeQueue.push(queuePlayer);
           currentPlayerId = playerId;
-          console.log(`[WS] Player ${queuePlayer.playerName} (${playerId}) joined Global Auto Queue. Total queued: ${activeQueue.length}`);
 
           // Condition A: If 4 real players join, immediately launch 4-player real match!
           if (activeQueue.length >= 4) {
@@ -759,7 +743,6 @@ async function startServer() {
         if (type === "LEAVE_AUTO_QUEUE" || type === "leave_auto_queue") {
           const { playerId } = data;
           activeQueue = activeQueue.filter((qp) => qp.ws !== ws && (!playerId || qp.playerId !== playerId));
-          console.log(`[WS] Player left Global Auto Queue. Remaining: ${activeQueue.length}`);
           stopMatchmakingTimerIfEmpty();
           broadcastQueueUpdate();
           return;
@@ -771,7 +754,6 @@ async function startServer() {
             playerId,
             playerName,
             playerSurname,
-            playerAvatar,
             isTeamUpMode = false,
             isHomeEntryLockEnabled = true,
             isTokenBlockEnabled = false,
@@ -784,7 +766,6 @@ async function startServer() {
             id: playerId,
             name: playerName || "Host",
             surname: playerSurname || "",
-            avatar: playerAvatar || "",
             color: "RED",
             isCreator: true,
             ws,
@@ -817,13 +798,12 @@ async function startServer() {
               yourColor: "RED",
             })
           );
-          console.log(`[WS] Room ${code} created by host ${playerName} (${playerId})`);
           return;
         }
 
         // 2. JOIN_ROOM
         if (type === "JOIN_ROOM") {
-          const { roomCode, playerId, playerName, playerSurname, playerAvatar } = data;
+          const { roomCode, playerId, playerName, playerSurname } = data;
           if (!roomCode || !playerId) {
             ws.send(JSON.stringify({ type: "ERROR", message: "Invalid room code or player ID" }));
             return;
@@ -848,7 +828,6 @@ async function startServer() {
             existingPlayer.ws = ws;
             existingPlayer.name = playerName || existingPlayer.name;
             existingPlayer.surname = playerSurname || existingPlayer.surname;
-            existingPlayer.avatar = playerAvatar || existingPlayer.avatar;
             currentRoomCode = code;
             currentPlayerId = playerId;
 
@@ -895,7 +874,6 @@ async function startServer() {
             id: playerId,
             name: playerName || `Player ${room.players.length + 1}`,
             surname: playerSurname || "",
-            avatar: playerAvatar || "",
             color: availableColor,
             isCreator: false,
             ws,
@@ -917,7 +895,6 @@ async function startServer() {
               yourColor: availableColor,
             })
           );
-          console.log(`[WS] Player ${newPlayer.name} (${playerId}) joined room ${code} as ${availableColor}`);
           return;
         }
 
@@ -1004,8 +981,6 @@ async function startServer() {
 
           const sanitized = getSanitizedRoom(room);
 
-          console.log(`[WS] Game STARTING in room ${room.code} with ${room.players.length} players!`);
-
           broadcastToRoom(room, {
             type: "GAME_STARTED",
             room: sanitized,
@@ -1090,7 +1065,6 @@ async function startServer() {
             name: player.name,
             room: sanitized,
           });
-          console.log(`[WS] Player ${player.name} (${playerId}) REJOINED active room ${code}!`);
           return;
         }
 
@@ -1106,6 +1080,28 @@ async function startServer() {
           }
           if (currentRoomCode === targetCode) currentRoomCode = null;
           if (currentPlayerId === targetPlayerId) currentPlayerId = null;
+          return;
+        }
+
+        // 8.5 INDEPENDENT REAL-TIME GIFT CHANNEL
+        // Completely isolated from core game board data (turns, dice rolls, goti moves, full board sync, & timers).
+        // Gifts animate freely across all players' screens in parallel without stalling or interfering with the game.
+        if (type === "GIFT_EVENT" || type === "SEND_GIFT_EVENT" || type === "SEND_GIFT") {
+          const { roomCode, giftId, senderColor, receiverColor, senderPlayerId, timestamp } = data;
+          if (!roomCode) return;
+          const room = rooms.get(roomCode.toUpperCase());
+          if (!room) return;
+
+          // Broadcast directly to all clients in room without altering room.currentSeq, actionRingBuffer, or timers
+          broadcastToRoom(room, {
+            type: "GIFT_EVENT",
+            roomCode,
+            giftId,
+            senderColor,
+            receiverColor,
+            senderPlayerId,
+            timestamp: timestamp || Date.now(),
+          });
           return;
         }
 
@@ -1147,7 +1143,6 @@ async function startServer() {
                 if (rooms.has(room.code)) {
                   clearRoomTurnTimer(room);
                   rooms.delete(room.code);
-                  console.log(`[WS] 🗑️ Room ${room.code} permanently deleted after victory completion.`);
                 }
               }, 5000);
             } else if (typeof gameState.activePlayerIndex === "number") {
@@ -1196,7 +1191,6 @@ async function startServer() {
                 room.players = room.players.filter((p) => p.id !== targetPlayerId);
                 if (room.players.length === 0) {
                   rooms.delete(targetCode.toUpperCase());
-                  console.log(`[WS] Room ${targetCode} deleted (all players left lobby).`);
                 } else {
                   if (room.hostId === targetPlayerId) {
                     room.hostId = room.players[0].id;
@@ -1241,7 +1235,6 @@ async function startServer() {
             room.players = room.players.filter((p) => p.id !== currentPlayerId);
             if (room.players.length === 0) {
               rooms.delete(currentRoomCode);
-              console.log(`[WS] Room ${currentRoomCode} cleaned up after disconnect.`);
             } else {
               if (room.hostId === currentPlayerId) {
                 room.hostId = room.players[0].id;
