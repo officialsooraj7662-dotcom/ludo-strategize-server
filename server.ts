@@ -447,7 +447,7 @@ function launchAutoMatch(batch: QueuePlayer[]) {
     players: roomPlayers,
     isTeamUpMode: false,
     isHomeEntryLockEnabled: true,
-    isTokenBlockEnabled: false,
+    isTokenBlockEnabled: true,
     gameStarted: true,
     createdAt: Date.now(),
     currentSeq: 0,
@@ -563,7 +563,9 @@ function broadcastToRoom(room: RoomData, message: object) {
 
 async function startServer() {
   const app = express();
-  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+  const portArgIndex = process.argv.indexOf("--port");
+  const cliPort = portArgIndex !== -1 ? parseInt(process.argv[portArgIndex + 1], 10) : null;
+  const PORT = cliPort || (process.env.NODE_ENV === "production" && process.env.PORT ? parseInt(process.env.PORT, 10) : 3000);
 
   // CORS Middleware for Render & cross-origin frontend requests
   app.use((req, res, next) => {
@@ -600,8 +602,9 @@ async function startServer() {
       latestVersion: "1.0.0",
       minSupportedVersion: "1.0.0",
       minRequiredVersion: "1.0.0",
-      playStoreUrl: "https://play.google.com/store/apps/details?id=com.ludostrategize.game",
-      appStoreUrl: "https://apps.apple.com/app/ludo-game/id123456789",
+      updateUrl: "https://strategizestudio-commits.github.io/ludo-strategize/",
+      playStoreUrl: "https://strategizestudio-commits.github.io/ludo-strategize/",
+      appStoreUrl: "https://strategizestudio-commits.github.io/ludo-strategize/",
       releaseNotes: "Optimized online multiplayer and security enhancements",
     });
   });
@@ -756,7 +759,7 @@ async function startServer() {
             playerSurname,
             isTeamUpMode = false,
             isHomeEntryLockEnabled = true,
-            isTokenBlockEnabled = false,
+            isTokenBlockEnabled = true,
           } = data;
 
           if (!playerId) return;
@@ -1254,6 +1257,10 @@ async function startServer() {
       }
     });
   });
+
+  // Serve public assets (l.jpg, logo.svg, etc.) directly
+  const publicPath = path.join(process.cwd(), "public");
+  app.use(express.static(publicPath));
 
   // Client Static Files / Vite Dev fallback (keeps preview working)
   if (process.env.NODE_ENV !== "production") {
