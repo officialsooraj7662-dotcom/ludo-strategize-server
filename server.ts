@@ -599,9 +599,9 @@ async function startServer() {
   // App version check endpoint
   app.get("/api/app-version", (_req, res) => {
     res.json({
-      latestVersion: "1.0.0",
-      minSupportedVersion: "1.0.0",
-      minRequiredVersion: "1.0.0",
+      latestVersion: "1.0.1",
+      minSupportedVersion: "1.0.1",
+      minRequiredVersion: "1.0.1",
       updateUrl: "https://strategizestudio-commits.github.io/ludo-strategize/",
       playStoreUrl: "https://strategizestudio-commits.github.io/ludo-strategize/",
       appStoreUrl: "https://strategizestudio-commits.github.io/ludo-strategize/",
