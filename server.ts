@@ -351,7 +351,7 @@ function getRandomOpponentNames(count: number, excludeNames: string[] = []): str
 
 // --- GLOBAL AUTO MATCHMAKING QUEUE (60 SECONDS TIMEOUT) ---
 interface QueuePlayer {
-  ws: WebSocket;
+  ws: WebSocket | null;
   playerId: string;
   playerName: string;
   playerSurname?: string;
@@ -706,18 +706,22 @@ async function startServer() {
             return;
           }
 
-          // Remove any existing entry for this player / socket first to prevent duplicates
-          activeQueue = activeQueue.filter((qp) => qp.playerId !== playerId && qp.ws !== ws);
-
-          const queuePlayer: QueuePlayer = {
-            ws,
-            playerId,
-            playerName: playerName || `Player`,
-            playerSurname: playerSurname || "",
-            joinedAt: Date.now(),
-          };
-
-          activeQueue.push(queuePlayer);
+          // Check if player is already in queue by playerId
+          const existingIndex = activeQueue.findIndex((qp) => qp.playerId === playerId);
+          if (existingIndex !== -1) {
+            activeQueue[existingIndex].ws = ws;
+            activeQueue[existingIndex].playerName = playerName || activeQueue[existingIndex].playerName;
+            activeQueue[existingIndex].playerSurname = playerSurname || activeQueue[existingIndex].playerSurname;
+          } else {
+            const queuePlayer: QueuePlayer = {
+              ws,
+              playerId,
+              playerName: playerName || `Player`,
+              playerSurname: playerSurname || "",
+              joinedAt: Date.now(),
+            };
+            activeQueue.push(queuePlayer);
+          }
           currentPlayerId = playerId;
 
           // Condition A: If 4 real players join, immediately launch 4-player real match!
@@ -829,6 +833,7 @@ async function startServer() {
           const existingPlayer = room.players.find((p) => p.id === playerId);
           if (existingPlayer) {
             existingPlayer.ws = ws;
+            existingPlayer.isOffline = false;
             existingPlayer.name = playerName || existingPlayer.name;
             existingPlayer.surname = playerSurname || existingPlayer.surname;
             currentRoomCode = code;
@@ -1221,12 +1226,11 @@ async function startServer() {
     });
 
     ws.on("close", () => {
-      // 1. Remove from global auto matchmaking queue if present
-      const wasInQueue = activeQueue.some((qp) => qp.ws === ws);
-      if (wasInQueue) {
-        activeQueue = activeQueue.filter((qp) => qp.ws !== ws);
-        stopMatchmakingTimerIfEmpty();
-        broadcastQueueUpdate();
+      // 1. Mark player socket as null in queue (Grace Period against network drops - do not instantly remove from queue)
+      for (const qp of activeQueue) {
+        if (qp.ws === ws) {
+          qp.ws = null;
+        }
       }
 
       // 2. Room handling on disconnect
@@ -1234,21 +1238,17 @@ async function startServer() {
         const room = rooms.get(currentRoomCode);
         if (room) {
           if (!room.gameStarted) {
-            // Before game start: Remove player from lobby
-            room.players = room.players.filter((p) => p.id !== currentPlayerId);
-            if (room.players.length === 0) {
-              rooms.delete(currentRoomCode);
-            } else {
-              if (room.hostId === currentPlayerId) {
-                room.hostId = room.players[0].id;
-                room.players[0].isCreator = true;
-              }
-              const sanitized = getSanitizedRoom(room);
-              broadcastToRoom(room, {
-                type: "ROOM_UPDATED",
-                room: sanitized,
-              });
+            // Before game start: Mark player as offline in lobby (persist in room until explicit exit)
+            const p = room.players.find((player) => player.id === currentPlayerId);
+            if (p) {
+              p.isOffline = true;
+              p.ws = null;
             }
+            const sanitized = getSanitizedRoom(room);
+            broadcastToRoom(room, {
+              type: "ROOM_UPDATED",
+              room: sanitized,
+            });
           } else {
             // After game start: Player went offline. If only 1 player remains in match, declare winner and then delete room!
             handlePlayerDisconnectOrForfeit(room, currentPlayerId, false);
