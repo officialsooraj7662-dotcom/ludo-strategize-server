@@ -454,6 +454,36 @@ function launchAutoMatch(batch: QueuePlayer[]) {
     actionRingBuffer: [],
     activePlayerIndex: 0,
     playerMissedTurns: new Map(),
+    gameState: {
+      mode: "ONLINE",
+      gameStarted: true,
+      activePlayerIndex: 0,
+      diceQueue: [],
+      diceRollCountThisTurn: 0,
+      consecutiveSixesCount: 0,
+      isTeamUpMode: false,
+      isHomeEntryLockEnabled: true,
+      isTokenBlockEnabled: true,
+      players: roomPlayers.map((p, idx) => ({
+        color: p.color,
+        name: p.name,
+        surname: p.surname || "",
+        isBot: false,
+        isOffline: false,
+        hasKilledOpponent: false,
+        tokens: [0, 1, 2, 3].map((id) => ({
+          id,
+          color: p.color,
+          state: "BASE",
+          position: -1,
+        })),
+        isActive: idx === 0,
+        rollHistory: [],
+        lastRolledValue: 6,
+        turnsWithoutSix: 0,
+      })),
+      logs: [`🎮 Online Auto Match Started with ${realCount} Warriors! ${roomPlayers[0]?.name} goes first!`],
+    },
   };
 
   rooms.set(roomCode, newRoom);
@@ -464,6 +494,7 @@ function launchAutoMatch(batch: QueuePlayer[]) {
     room: sanitized,
     isAutoMatch: true,
     realCount,
+    gameState: newRoom.gameState,
   });
 
   // Start turn timer for first active player
@@ -987,11 +1018,43 @@ async function startServer() {
           room.activePlayerIndex = 0;
           room.playerMissedTurns = new Map();
 
+          room.gameState = {
+            mode: "ONLINE",
+            gameStarted: true,
+            activePlayerIndex: 0,
+            diceQueue: [],
+            diceRollCountThisTurn: 0,
+            consecutiveSixesCount: 0,
+            isTeamUpMode: room.isTeamUpMode,
+            isHomeEntryLockEnabled: room.isHomeEntryLockEnabled,
+            isTokenBlockEnabled: room.isTokenBlockEnabled,
+            players: room.players.map((p, idx) => ({
+              color: p.color,
+              name: p.name,
+              surname: p.surname || "",
+              isBot: Boolean(p.isBot),
+              isOffline: Boolean(p.isOffline),
+              hasKilledOpponent: false,
+              tokens: [0, 1, 2, 3].map((id) => ({
+                id,
+                color: p.color,
+                state: "BASE",
+                position: -1,
+              })),
+              isActive: idx === 0,
+              rollHistory: [],
+              lastRolledValue: 6,
+              turnsWithoutSix: 0,
+            })),
+            logs: [`🎮 Online Ludo Match Started with ${room.players.length} Warriors! ${room.players[0]?.name} goes first!${room.isTeamUpMode ? ' [Team Up Mode ACTIVE]' : ''}`],
+          };
+
           const sanitized = getSanitizedRoom(room);
 
           broadcastToRoom(room, {
             type: "GAME_STARTED",
             room: sanitized,
+            gameState: room.gameState,
           });
 
           // Start authoritative 23s turn timer for the initial active player
