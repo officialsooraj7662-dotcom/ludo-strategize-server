@@ -160,10 +160,10 @@ function startRoomTurnTimer(room: RoomData) {
     }
   }, 20000);
 
-  // 23s Authoritative Server Skip Buffer (20s client + 3s network grace margin)
+  // 20s Authoritative Server Turn Timeout
   room.turnTimer23 = setTimeout(() => {
     advanceRoomTurnOnTimeout(room, activePlayer, false);
-  }, 23000);
+  }, 20000);
 }
 
 function handlePlayerDisconnectOrForfeit(room: RoomData, playerId: string, isPermanentLeave: boolean = false) {
