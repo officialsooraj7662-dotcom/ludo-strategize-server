@@ -80,6 +80,7 @@ interface RoomData {
   turnTimer20?: NodeJS.Timeout | null;
   turnTimer23?: NodeJS.Timeout | null;
   playerMissedTurns: Map<string, number>;
+  disconnectTimers: Map<string, NodeJS.Timeout>;
 }
 
 const rooms = new Map<string, RoomData>();
@@ -385,6 +386,7 @@ function launchAutoMatch(io: Server, batch: QueuePlayer[]) {
     actionRingBuffer: [],
     activePlayerIndex: 0,
     playerMissedTurns: new Map(),
+    disconnectTimers: new Map(),
   };
 
   rooms.set(roomCode, newRoom);
@@ -499,8 +501,8 @@ async function startServer() {
   const server = http.createServer(app);
   const io = new Server(server, {
     cors: { origin: "*" },
-    pingInterval: 25000,
-    pingTimeout: 20000,
+    pingInterval: 10000,
+    pingTimeout: 10000,
   });
 
   io.on("connection", (socket: Socket) => {
@@ -588,6 +590,7 @@ async function startServer() {
             actionRingBuffer: [],
             activePlayerIndex: 0,
             playerMissedTurns: new Map(),
+            disconnectTimers: new Map(),
           };
           rooms.set(code, newRoom);
           socket.join(code);
@@ -749,6 +752,11 @@ async function startServer() {
           const player = room.players.find((p) => p.id === playerId);
           if (!player) return;
 
+          if (room.disconnectTimers && room.disconnectTimers.has(playerId)) {
+            clearTimeout(room.disconnectTimers.get(playerId)!);
+            room.disconnectTimers.delete(playerId);
+          }
+
           player.socketId = socket.id;
           player.isOffline = false;
           player.hasQuit = false;
@@ -898,7 +906,17 @@ async function startServer() {
               broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: getSanitizedRoom(room) });
             }
           } else {
-            handlePlayerDisconnectOrForfeit(io, room, currentPlayerId, false);
+            // 20 seconds grace period before marking player offline / forfeit as requested
+            if (!room.disconnectTimers) room.disconnectTimers = new Map();
+            if (room.disconnectTimers.has(currentPlayerId)) {
+              clearTimeout(room.disconnectTimers.get(currentPlayerId)!);
+            }
+            const timer = setTimeout(() => {
+              if (rooms.has(room.code)) {
+                handlePlayerDisconnectOrForfeit(io, room, currentPlayerId!, false);
+              }
+            }, 20000); // 20 seconds grace timing
+            room.disconnectTimers.set(currentPlayerId, timer);
           }
         }
       }
