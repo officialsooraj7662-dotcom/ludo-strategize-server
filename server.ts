@@ -160,10 +160,10 @@ function startRoomTurnTimer(room: RoomData) {
     }
   }, 20000);
 
-  // 20s Authoritative Server Turn Timeout
+  // 23s Authoritative Server Skip Buffer (20s client + 3s network grace margin)
   room.turnTimer23 = setTimeout(() => {
     advanceRoomTurnOnTimeout(room, activePlayer, false);
-  }, 20000);
+  }, 23000);
 }
 
 function handlePlayerDisconnectOrForfeit(room: RoomData, playerId: string, isPermanentLeave: boolean = false) {
@@ -351,7 +351,7 @@ function getRandomOpponentNames(count: number, excludeNames: string[] = []): str
 
 // --- GLOBAL AUTO MATCHMAKING QUEUE (60 SECONDS TIMEOUT) ---
 interface QueuePlayer {
-  ws: WebSocket | null;
+  ws: WebSocket;
   playerId: string;
   playerName: string;
   playerSurname?: string;
@@ -454,36 +454,6 @@ function launchAutoMatch(batch: QueuePlayer[]) {
     actionRingBuffer: [],
     activePlayerIndex: 0,
     playerMissedTurns: new Map(),
-    gameState: {
-      mode: "ONLINE",
-      gameStarted: true,
-      activePlayerIndex: 0,
-      diceQueue: [],
-      diceRollCountThisTurn: 0,
-      consecutiveSixesCount: 0,
-      isTeamUpMode: false,
-      isHomeEntryLockEnabled: true,
-      isTokenBlockEnabled: true,
-      players: roomPlayers.map((p, idx) => ({
-        color: p.color,
-        name: p.name,
-        surname: p.surname || "",
-        isBot: false,
-        isOffline: false,
-        hasKilledOpponent: false,
-        tokens: [0, 1, 2, 3].map((id) => ({
-          id,
-          color: p.color,
-          state: "BASE",
-          position: -1,
-        })),
-        isActive: idx === 0,
-        rollHistory: [],
-        lastRolledValue: 6,
-        turnsWithoutSix: 0,
-      })),
-      logs: [`🎮 Online Auto Match Started with ${realCount} Warriors! ${roomPlayers[0]?.name} goes first!`],
-    },
   };
 
   rooms.set(roomCode, newRoom);
@@ -494,7 +464,6 @@ function launchAutoMatch(batch: QueuePlayer[]) {
     room: sanitized,
     isAutoMatch: true,
     realCount,
-    gameState: newRoom.gameState,
   });
 
   // Start turn timer for first active player
@@ -737,22 +706,18 @@ async function startServer() {
             return;
           }
 
-          // Check if player is already in queue by playerId
-          const existingIndex = activeQueue.findIndex((qp) => qp.playerId === playerId);
-          if (existingIndex !== -1) {
-            activeQueue[existingIndex].ws = ws;
-            activeQueue[existingIndex].playerName = playerName || activeQueue[existingIndex].playerName;
-            activeQueue[existingIndex].playerSurname = playerSurname || activeQueue[existingIndex].playerSurname;
-          } else {
-            const queuePlayer: QueuePlayer = {
-              ws,
-              playerId,
-              playerName: playerName || `Player`,
-              playerSurname: playerSurname || "",
-              joinedAt: Date.now(),
-            };
-            activeQueue.push(queuePlayer);
-          }
+          // Remove any existing entry for this player / socket first to prevent duplicates
+          activeQueue = activeQueue.filter((qp) => qp.playerId !== playerId && qp.ws !== ws);
+
+          const queuePlayer: QueuePlayer = {
+            ws,
+            playerId,
+            playerName: playerName || `Player`,
+            playerSurname: playerSurname || "",
+            joinedAt: Date.now(),
+          };
+
+          activeQueue.push(queuePlayer);
           currentPlayerId = playerId;
 
           // Condition A: If 4 real players join, immediately launch 4-player real match!
@@ -864,7 +829,6 @@ async function startServer() {
           const existingPlayer = room.players.find((p) => p.id === playerId);
           if (existingPlayer) {
             existingPlayer.ws = ws;
-            existingPlayer.isOffline = false;
             existingPlayer.name = playerName || existingPlayer.name;
             existingPlayer.surname = playerSurname || existingPlayer.surname;
             currentRoomCode = code;
@@ -1018,43 +982,11 @@ async function startServer() {
           room.activePlayerIndex = 0;
           room.playerMissedTurns = new Map();
 
-          room.gameState = {
-            mode: "ONLINE",
-            gameStarted: true,
-            activePlayerIndex: 0,
-            diceQueue: [],
-            diceRollCountThisTurn: 0,
-            consecutiveSixesCount: 0,
-            isTeamUpMode: room.isTeamUpMode,
-            isHomeEntryLockEnabled: room.isHomeEntryLockEnabled,
-            isTokenBlockEnabled: room.isTokenBlockEnabled,
-            players: room.players.map((p, idx) => ({
-              color: p.color,
-              name: p.name,
-              surname: p.surname || "",
-              isBot: Boolean(p.isBot),
-              isOffline: Boolean(p.isOffline),
-              hasKilledOpponent: false,
-              tokens: [0, 1, 2, 3].map((id) => ({
-                id,
-                color: p.color,
-                state: "BASE",
-                position: -1,
-              })),
-              isActive: idx === 0,
-              rollHistory: [],
-              lastRolledValue: 6,
-              turnsWithoutSix: 0,
-            })),
-            logs: [`🎮 Online Ludo Match Started with ${room.players.length} Warriors! ${room.players[0]?.name} goes first!${room.isTeamUpMode ? ' [Team Up Mode ACTIVE]' : ''}`],
-          };
-
           const sanitized = getSanitizedRoom(room);
 
           broadcastToRoom(room, {
             type: "GAME_STARTED",
             room: sanitized,
-            gameState: room.gameState,
           });
 
           // Start authoritative 23s turn timer for the initial active player
@@ -1289,11 +1221,12 @@ async function startServer() {
     });
 
     ws.on("close", () => {
-      // 1. Mark player socket as null in queue (Grace Period against network drops - do not instantly remove from queue)
-      for (const qp of activeQueue) {
-        if (qp.ws === ws) {
-          qp.ws = null;
-        }
+      // 1. Remove from global auto matchmaking queue if present
+      const wasInQueue = activeQueue.some((qp) => qp.ws === ws);
+      if (wasInQueue) {
+        activeQueue = activeQueue.filter((qp) => qp.ws !== ws);
+        stopMatchmakingTimerIfEmpty();
+        broadcastQueueUpdate();
       }
 
       // 2. Room handling on disconnect
@@ -1301,17 +1234,21 @@ async function startServer() {
         const room = rooms.get(currentRoomCode);
         if (room) {
           if (!room.gameStarted) {
-            // Before game start: Mark player as offline in lobby (persist in room until explicit exit)
-            const p = room.players.find((player) => player.id === currentPlayerId);
-            if (p) {
-              p.isOffline = true;
-              p.ws = null;
+            // Before game start: Remove player from lobby
+            room.players = room.players.filter((p) => p.id !== currentPlayerId);
+            if (room.players.length === 0) {
+              rooms.delete(currentRoomCode);
+            } else {
+              if (room.hostId === currentPlayerId) {
+                room.hostId = room.players[0].id;
+                room.players[0].isCreator = true;
+              }
+              const sanitized = getSanitizedRoom(room);
+              broadcastToRoom(room, {
+                type: "ROOM_UPDATED",
+                room: sanitized,
+              });
             }
-            const sanitized = getSanitizedRoom(room);
-            broadcastToRoom(room, {
-              type: "ROOM_UPDATED",
-              room: sanitized,
-            });
           } else {
             // After game start: Player went offline. If only 1 player remains in match, declare winner and then delete room!
             handlePlayerDisconnectOrForfeit(room, currentPlayerId, false);
