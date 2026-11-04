@@ -311,13 +311,16 @@ let activeQueue: QueuePlayer[] = [];
 let matchmakingTimerInterval: NodeJS.Timeout | null = null;
 let matchmakingCountdown = 60;
 const MATCHMAKING_TIMEOUT = 60;
+let matchmakingTargetTime = 0;
 
 function broadcastQueueUpdate(io: Server) {
+  const timeLeft = matchmakingTargetTime > 0 ? Math.max(0, Math.round((matchmakingTargetTime - Date.now()) / 1000)) : matchmakingCountdown;
   const payload = {
     type: "QUEUE_UPDATE",
     count: activeQueue.length,
-    timeLeft: matchmakingCountdown,
+    timeLeft,
     totalTime: MATCHMAKING_TIMEOUT,
+    targetTime: matchmakingTargetTime,
     players: activeQueue.map((qp, idx) => ({
       id: qp.playerId,
       name: qp.playerName || `Player ${idx + 1}`,
@@ -400,10 +403,10 @@ function launchAutoMatch(io: Server, batch: QueuePlayer[]) {
 function startMatchmakingTimer(io: Server) {
   if (matchmakingTimerInterval) return;
   matchmakingCountdown = MATCHMAKING_TIMEOUT;
+  matchmakingTargetTime = Date.now() + MATCHMAKING_TIMEOUT * 1000;
   broadcastQueueUpdate(io);
   matchmakingTimerInterval = setInterval(() => {
     matchmakingCountdown -= 1;
-    broadcastQueueUpdate(io);
     if (matchmakingCountdown <= 0) {
       if (matchmakingTimerInterval) {
         clearInterval(matchmakingTimerInterval);
@@ -417,7 +420,10 @@ function startMatchmakingTimer(io: Server) {
         startMatchmakingTimer(io);
       } else {
         matchmakingCountdown = MATCHMAKING_TIMEOUT;
+        matchmakingTargetTime = 0;
       }
+    } else {
+      broadcastQueueUpdate(io);
     }
   }, 1000);
 }
@@ -427,6 +433,7 @@ function stopMatchmakingTimerIfEmpty(io: Server) {
     clearInterval(matchmakingTimerInterval);
     matchmakingTimerInterval = null;
     matchmakingCountdown = MATCHMAKING_TIMEOUT;
+    matchmakingTargetTime = 0;
   }
 }
 
