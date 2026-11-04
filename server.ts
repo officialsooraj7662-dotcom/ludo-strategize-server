@@ -109,7 +109,7 @@ function startRoomTurnTimer(io: Server, room: RoomData) {
   if (!activePlayer) return;
   const isOffline = activePlayer.isOffline || activePlayer.hasQuit;
   if (isOffline) {
-    room.turnTimer23 = setTimeout(() => {
+    room.turnTimer20 = setTimeout(() => {
       advanceRoomTurnOnTimeout(io, room, activePlayer, true);
     }, 1000);
     return;
@@ -124,17 +124,8 @@ function startRoomTurnTimer(io: Server, room: RoomData) {
     }
   }, 10000);
   room.turnTimer20 = setTimeout(() => {
-    if (activePlayer.socketId) {
-      io.to(activePlayer.socketId).emit("message", {
-        type: "TURN_PING",
-        seq: room.currentSeq,
-        timeElapsed: 20,
-      });
-    }
-  }, 20000);
-  room.turnTimer23 = setTimeout(() => {
     advanceRoomTurnOnTimeout(io, room, activePlayer, false);
-  }, 23000);
+  }, 20000);
 }
 
 function broadcastToRoom(io: Server, room: RoomData, message: object) {
