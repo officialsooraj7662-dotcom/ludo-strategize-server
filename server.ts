@@ -835,6 +835,14 @@ async function startServer() {
           if (!roomCode || !Array.isArray(missingSeqs)) return;
           const room = rooms.get(roomCode.toUpperCase());
           if (!room) return;
+          // Send authoritative full board state snapshot for instant sequence reconciliation
+          socket.emit("message", {
+            type: "FULL_BOARD_STATE",
+            roomCode,
+            seq: room.currentSeq,
+            lastActionSequenceId: room.currentSeq,
+            gameState: room.gameState,
+          });
           const foundPackets = (room.actionRingBuffer || []).filter((p) => missingSeqs.includes(p.seq));
           socket.emit("message", { type: "RESEND_SEQ", roomCode, packets: foundPackets });
           return;
