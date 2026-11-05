@@ -74,31 +74,18 @@ interface RoomData {
   winnerColor?: string | null;
   createdAt: number;
   currentSeq: number;
-  actionRingBuffer: GameActionPacket[];
   activePlayerIndex: number;
   turnTimer10?: NodeJS.Timeout | null;
   turnTimer20?: NodeJS.Timeout | null;
-  turnTimer23?: NodeJS.Timeout | null;
   playerMissedTurns: Map<string, number>;
   disconnectTimers: Map<string, NodeJS.Timeout>;
 }
 
 const rooms = new Map<string, RoomData>();
 
-function pushActionToRingBuffer(room: RoomData, packet: GameActionPacket) {
-  if (!room.actionRingBuffer) {
-    room.actionRingBuffer = [];
-  }
-  room.actionRingBuffer.push(packet);
-  if (room.actionRingBuffer.length > 10) {
-    room.actionRingBuffer.shift();
-  }
-}
-
 function clearRoomTurnTimer(room: RoomData) {
   if (room.turnTimer10) { clearTimeout(room.turnTimer10); room.turnTimer10 = null; }
   if (room.turnTimer20) { clearTimeout(room.turnTimer20); room.turnTimer20 = null; }
-  if (room.turnTimer23) { clearTimeout(room.turnTimer23); room.turnTimer23 = null; }
 }
 
 function startRoomTurnTimer(io: Server, room: RoomData) {
@@ -111,7 +98,7 @@ function startRoomTurnTimer(io: Server, room: RoomData) {
   if (isOffline) {
     room.turnTimer20 = setTimeout(() => {
       advanceRoomTurnOnTimeout(io, room, activePlayer, true);
-    }, 1000);
+    }, 1500);
     return;
   }
   room.turnTimer10 = setTimeout(() => {
@@ -167,67 +154,69 @@ function handlePlayerDisconnectOrForfeit(io: Server, room: RoomData, playerId: s
 
   if (!room.gameStarted || room.winnerColor) return;
 
-  const activePlayers = room.players.filter((pl) => !pl.hasQuit && !pl.isOffline);
-  if (activePlayers.length === 1) {
-    const winnerPlayer = activePlayers[0];
-    room.winnerColor = winnerPlayer.color;
-    clearRoomTurnTimer(room);
-    const updatedPlayers = room.players.map((pl) => {
-      const existing = room.gameState?.players?.find((gp: any) => gp.color === pl.color);
-      return {
-        ...(existing || {
-          color: pl.color,
-          name: pl.name,
-          tokens: [0, 1, 2, 3].map((id) => ({ id, color: pl.color, state: "BASE", position: -1 })),
-        }),
-        isOffline: Boolean(pl.isOffline),
-        hasQuit: Boolean(pl.hasQuit),
-      };
-    });
-    const winLog = `👑 CONGRATULATIONS! ${winnerPlayer.name} is declared the WINNER as opponent disconnected / left the match!`;
-    const existingLogs = Array.isArray(room.gameState?.logs) ? room.gameState.logs : [];
-    room.gameState = {
-      ...(room.gameState || {}),
-      gameStarted: true,
-      winnerColor: winnerPlayer.color,
-      rankings: [winnerPlayer.color],
-      players: updatedPlayers,
-      logs: [winLog, ...existingLogs],
-    };
-    room.currentSeq = (room.currentSeq || 0) + 1;
-
-    broadcastToRoom(io, room, {
-      type: "WINNER_DECLARED",
-      roomCode: room.code,
-      winnerColor: winnerPlayer.color,
-      winnerName: winnerPlayer.name,
-      reason: "OPPONENT_OFFLINE",
-      gameState: room.gameState,
-      room: getSanitizedRoom(room),
-    });
-    broadcastToRoom(io, room, {
-      type: "SYNC_GAME_STATE",
-      roomCode: room.code,
-      seq: room.currentSeq,
-      gameState: room.gameState,
-    });
-    broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: getSanitizedRoom(room) });
-
-    setTimeout(() => {
-      if (rooms.has(room.code)) {
-        clearRoomTurnTimer(room);
-        rooms.delete(room.code);
-      }
-    }, 5000);
-  } else if (activePlayers.length === 0) {
-    clearRoomTurnTimer(room);
-    rooms.delete(room.code);
-  } else {
-    const currentActivePlayer = room.players[room.activePlayerIndex];
-    if (currentActivePlayer && currentActivePlayer.id === playerId) {
+  // Only declare winner if player explicitly forfeits OR if permanent leave was confirmed
+  if (isPermanentLeave) {
+    const activePlayers = room.players.filter((pl) => !pl.hasQuit);
+    if (activePlayers.length === 1) {
+      const winnerPlayer = activePlayers[0];
+      room.winnerColor = winnerPlayer.color;
       clearRoomTurnTimer(room);
-      advanceRoomTurnOnTimeout(io, room, currentActivePlayer, true);
+      const updatedPlayers = room.players.map((pl) => {
+        const existing = room.gameState?.players?.find((gp: any) => gp.color === pl.color);
+        return {
+          ...(existing || {
+            color: pl.color,
+            name: pl.name,
+            tokens: [0, 1, 2, 3].map((id) => ({ id, color: pl.color, state: "BASE", position: -1 })),
+          }),
+          isOffline: Boolean(pl.isOffline),
+          hasQuit: Boolean(pl.hasQuit),
+        };
+      });
+      const winLog = `👑 ${winnerPlayer.name} is declared the WINNER! Opponent left the match.`;
+      const existingLogs = Array.isArray(room.gameState?.logs) ? room.gameState.logs : [];
+      room.gameState = {
+        ...(room.gameState || {}),
+        gameStarted: true,
+        winnerColor: winnerPlayer.color,
+        rankings: [winnerPlayer.color],
+        players: updatedPlayers,
+        logs: [winLog, ...existingLogs],
+      };
+      room.currentSeq = (room.currentSeq || 0) + 1;
+
+      broadcastToRoom(io, room, {
+        type: "WINNER_DECLARED",
+        roomCode: room.code,
+        winnerColor: winnerPlayer.color,
+        winnerName: winnerPlayer.name,
+        reason: "OPPONENT_OFFLINE",
+        gameState: room.gameState,
+        room: getSanitizedRoom(room),
+      });
+      broadcastToRoom(io, room, {
+        type: "SYNC_GAME_STATE",
+        roomCode: room.code,
+        seq: room.currentSeq,
+        gameState: room.gameState,
+      });
+      broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: getSanitizedRoom(room) });
+
+      setTimeout(() => {
+        if (rooms.has(room.code)) {
+          clearRoomTurnTimer(room);
+          rooms.delete(room.code);
+        }
+      }, 5000);
+      return;
     }
+  }
+
+  // If the active player is offline, advance their turn without declaring instant loss
+  const currentActivePlayer = room.players[room.activePlayerIndex];
+  if (currentActivePlayer && currentActivePlayer.id === playerId) {
+    clearRoomTurnTimer(room);
+    advanceRoomTurnOnTimeout(io, room, currentActivePlayer, true);
   }
 }
 
@@ -238,7 +227,7 @@ function advanceRoomTurnOnTimeout(io: Server, room: RoomData, activePlayer: Room
     const currentMisses = (room.playerMissedTurns.get(activePlayer.id) || 0) + 1;
     room.playerMissedTurns.set(activePlayer.id, currentMisses);
     if (currentMisses >= 3) {
-      handlePlayerDisconnectOrForfeit(io, room, activePlayer.id, false);
+      handlePlayerDisconnectOrForfeit(io, room, activePlayer.id, true);
       if (room.winnerColor) return;
     }
   }
@@ -262,7 +251,6 @@ function advanceRoomTurnOnTimeout(io: Server, room: RoomData, activePlayer: Room
     isOffline: activePlayer.isOffline,
     timestamp: Date.now(),
   };
-  pushActionToRingBuffer(room, skipPacket);
   broadcastToRoom(io, room, skipPacket);
   startRoomTurnTimer(io, room);
 }
@@ -377,24 +365,44 @@ function launchAutoMatch(io: Server, batch: QueuePlayer[]) {
     gameStarted: true,
     createdAt: Date.now(),
     currentSeq: 0,
-    actionRingBuffer: [],
     activePlayerIndex: 0,
     playerMissedTurns: new Map(),
     disconnectTimers: new Map(),
   };
 
   rooms.set(roomCode, newRoom);
-  batch.forEach(qp => qp.socket.join(roomCode));
-
   const sanitized = getSanitizedRoom(newRoom);
+
+  batch.forEach((qp, idx) => {
+    qp.socket.join(roomCode);
+    qp.socket.data = qp.socket.data || {};
+    qp.socket.data.roomCode = roomCode;
+    qp.socket.data.playerId = qp.playerId;
+    // Send direct event to ensure no packet is missed
+    qp.socket.emit("message", {
+      type: "GAME_STARTED",
+      room: sanitized,
+      yourColor: assignedColors[idx],
+      isAutoMatch: true,
+      realCount,
+    });
+  });
+
   broadcastToRoom(io, newRoom, { type: "GAME_STARTED", room: sanitized, isAutoMatch: true, realCount });
   startRoomTurnTimer(io, newRoom);
 }
 
 function startMatchmakingTimer(io: Server) {
-  if (matchmakingTimerInterval) return;
-  matchmakingCountdown = MATCHMAKING_TIMEOUT;
-  matchmakingTargetTime = Date.now() + MATCHMAKING_TIMEOUT * 1000;
+  if (matchmakingTimerInterval) {
+    if (activeQueue.length >= 2 && matchmakingCountdown > 5) {
+      matchmakingCountdown = 5;
+      matchmakingTargetTime = Date.now() + 5000;
+      broadcastQueueUpdate(io);
+    }
+    return;
+  }
+  matchmakingCountdown = activeQueue.length >= 2 ? 5 : MATCHMAKING_TIMEOUT;
+  matchmakingTargetTime = Date.now() + matchmakingCountdown * 1000;
   broadcastQueueUpdate(io);
   matchmakingTimerInterval = setInterval(() => {
     matchmakingCountdown -= 1;
@@ -585,7 +593,6 @@ async function startServer() {
             gameStarted: false,
             createdAt: Date.now(),
             currentSeq: 0,
-            actionRingBuffer: [],
             activePlayerIndex: 0,
             playerMissedTurns: new Map(),
             disconnectTimers: new Map(),
@@ -708,7 +715,6 @@ async function startServer() {
           }
           room.gameStarted = true;
           room.currentSeq = 0;
-          room.actionRingBuffer = [];
           room.activePlayerIndex = 0;
           room.playerMissedTurns = new Map();
 
@@ -831,17 +837,16 @@ async function startServer() {
             }
           }
 
-          pushActionToRingBuffer(room, data);
           broadcastToRoom(io, room, data);
           return;
         }
 
         if (type === "FETCH_SEQ" || type === "fetch_seq") {
-          const { roomCode, missingSeqs } = data;
-          if (!roomCode || !Array.isArray(missingSeqs)) return;
+          const { roomCode } = data;
+          if (!roomCode) return;
           const room = rooms.get(roomCode.toUpperCase());
           if (!room) return;
-          // Send authoritative full board state snapshot for instant sequence reconciliation
+          // Send authoritative full board state snapshot
           socket.emit("message", {
             type: "FULL_BOARD_STATE",
             roomCode,
@@ -849,8 +854,6 @@ async function startServer() {
             lastActionSequenceId: room.currentSeq,
             gameState: room.gameState,
           });
-          const foundPackets = (room.actionRingBuffer || []).filter((p) => missingSeqs.includes(p.seq));
-          socket.emit("message", { type: "RESEND_SEQ", roomCode, packets: foundPackets });
           return;
         }
 
