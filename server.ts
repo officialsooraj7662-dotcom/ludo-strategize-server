@@ -2,6 +2,7 @@
  * STANDALONE LUDO MULTIPLAYER SOCKET.IO & HTTP SERVER
  */
 import express from "express";
+import fs from "fs";
 import http from "http";
 import path from "path";
 import { Server, Socket } from "socket.io";
@@ -938,9 +939,14 @@ async function startServer() {
     } catch {}
   } else {
     const distPath = path.join(process.cwd(), "dist");
+    const indexPath = path.join(distPath, "index.html");
     app.use(express.static(distPath));
     app.get("*", (_req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
+      if (fs.existsSync(indexPath)) {
+        res.sendFile(indexPath);
+      } else {
+        res.json({ service: "Ludo Multiplayer Socket.io Server", status: "running" });
+      }
     });
   }
 
