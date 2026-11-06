@@ -76,6 +76,8 @@ interface RoomData {
   createdAt: number;
   currentSeq: number;
   activePlayerIndex: number;
+  lastAction?: any;
+  lastActionTime?: number;
   turnTimer10?: NodeJS.Timeout | null;
   turnTimer20?: NodeJS.Timeout | null;
   playerMissedTurns: Map<string, number>;
@@ -771,7 +773,13 @@ async function startServer() {
           currentPlayerId = playerId;
 
           const sanitized = getSanitizedRoom(room);
-          socket.emit("message", { type: "REJOIN_SUCCESS", room: sanitized, yourColor: player.color, gameState: room.gameState });
+          socket.emit("message", {
+            type: "REJOIN_SUCCESS",
+            room: sanitized,
+            yourColor: player.color,
+            gameState: room.gameState,
+            lastAction: room.lastAction,
+          });
           broadcastToRoom(io, room, { type: "PLAYER_RECONNECTED", playerId: player.id, color: player.color, name: player.name, room: sanitized });
           return;
         }
@@ -819,7 +827,33 @@ async function startServer() {
           }
           data.timestamp = Date.now();
 
+          // Save last action for instant replay on reconnect
+          if (type === "ROLL_DICE" || type === "MOVE_PAWN") {
+            room.lastAction = data;
+            room.lastActionTime = Date.now();
+          }
+
+          if (type === "ROLL_DICE") {
+            // Give active player fresh 20 seconds to move their token!
+            startRoomTurnTimer(io, room);
+            // Authoritative dice queue update on server
+            if (room.gameState) {
+              const rollVal = Number(data.rollValue) || 1;
+              const prevQueue = Array.isArray(room.gameState.diceQueue) ? room.gameState.diceQueue : [];
+              room.gameState.diceQueue = [...prevQueue, rollVal];
+              room.gameState.selectedDiceValue = (rollVal === 6 ? null : rollVal);
+              if (Array.isArray(room.gameState.players) && room.gameState.players[room.activePlayerIndex]) {
+                room.gameState.players[room.activePlayerIndex].lastRolledValue = rollVal;
+              }
+            }
+          }
+
           if (gameState) {
+            // Prevent stale empty diceQueue from wiping active roll on ROLL_DICE
+            if (type === "ROLL_DICE" && (!gameState.diceQueue || gameState.diceQueue.length === 0)) {
+              gameState.diceQueue = [Number(data.rollValue) || 1];
+              gameState.selectedDiceValue = (Number(data.rollValue) === 6 ? null : (Number(data.rollValue) || 1));
+            }
             room.gameState = gameState;
             if (gameState.winnerColor) {
               room.winnerColor = gameState.winnerColor;
@@ -838,6 +872,13 @@ async function startServer() {
             }
           }
 
+          // Direct ACK confirmation back to sender
+          socket.emit("message", {
+            type: "ACTION_ACK",
+            actionType: type,
+            seq: data.seq,
+          });
+
           broadcastToRoom(io, room, data);
           return;
         }
@@ -854,6 +895,7 @@ async function startServer() {
             seq: room.currentSeq,
             lastActionSequenceId: room.currentSeq,
             gameState: room.gameState,
+            lastAction: room.lastAction,
           });
           return;
         }
