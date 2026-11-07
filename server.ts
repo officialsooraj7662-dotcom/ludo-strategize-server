@@ -1,5 +1,8 @@
 /**
+ * @license
  * STANDALONE LUDO MULTIPLAYER SOCKET.IO & HTTP SERVER
+ * SERVER-AUTHORITATIVE ARCHITECTURE WITH OFFLINE PACKET BUFFERING,
+ * SERVER-DRIVEN TURNS, +1S GRACE PERIOD & INSTANT REJOIN RECOVERY
  */
 import express from "express";
 import fs from "fs";
@@ -52,8 +55,6 @@ export interface GameActionPacket {
   forceDiceValue?: number;
   lastActionSequenceId?: number;
   gameState?: any;
-  missingSeqs?: number[];
-  packets?: GameActionPacket[];
   nextActiveIndex?: number;
   isOffline?: boolean;
   timestamp?: number;
@@ -80,15 +81,37 @@ interface RoomData {
   lastActionTime?: number;
   turnTimer10?: NodeJS.Timeout | null;
   turnTimer20?: NodeJS.Timeout | null;
+  turnTimerGrace?: NodeJS.Timeout | null;
   playerMissedTurns: Map<string, number>;
   disconnectTimers: Map<string, NodeJS.Timeout>;
 }
 
 const rooms = new Map<string, RoomData>();
 
+// Constants for track navigation
+const START_INDEX: Record<PlayerColor, number> = {
+  RED: 0,
+  GREEN: 13,
+  YELLOW: 26,
+  BLUE: 39,
+};
+
+const SAFE_INDICES = [0, 8, 13, 21, 26, 34, 39, 47];
+
+const COLOR_ORDER_2_PLAYERS: PlayerColor[] = ["RED", "YELLOW"];
+const COLOR_ORDER_3_PLAYERS: PlayerColor[] = ["RED", "GREEN", "YELLOW"];
+const COLOR_ORDER_4_PLAYERS: PlayerColor[] = ["RED", "GREEN", "YELLOW", "BLUE"];
+
+function areTeammates(c1: PlayerColor, c2: PlayerColor): boolean {
+  if ((c1 === "RED" && c2 === "YELLOW") || (c1 === "YELLOW" && c2 === "RED")) return true;
+  if ((c1 === "GREEN" && c2 === "BLUE") || (c1 === "BLUE" && c2 === "GREEN")) return true;
+  return false;
+}
+
 function clearRoomTurnTimer(room: RoomData) {
   if (room.turnTimer10) { clearTimeout(room.turnTimer10); room.turnTimer10 = null; }
   if (room.turnTimer20) { clearTimeout(room.turnTimer20); room.turnTimer20 = null; }
+  if (room.turnTimerGrace) { clearTimeout(room.turnTimerGrace); room.turnTimerGrace = null; }
 }
 
 function startRoomTurnTimer(io: Server, room: RoomData) {
@@ -97,6 +120,7 @@ function startRoomTurnTimer(io: Server, room: RoomData) {
   const activeIndex = room.activePlayerIndex ?? 0;
   const activePlayer = room.players[activeIndex];
   if (!activePlayer) return;
+
   const isOffline = activePlayer.isOffline || activePlayer.hasQuit;
   if (isOffline) {
     room.turnTimer20 = setTimeout(() => {
@@ -104,17 +128,30 @@ function startRoomTurnTimer(io: Server, room: RoomData) {
     }, 1500);
     return;
   }
+
+  // 10-second ping to notify client half time
   room.turnTimer10 = setTimeout(() => {
-    if (activePlayer.socketId) {
-      io.to(activePlayer.socketId).emit("message", {
-        type: "TURN_PING",
-        seq: room.currentSeq,
-        timeElapsed: 10,
-      });
-    }
+    broadcastToRoom(io, room, {
+      type: "TURN_PING",
+      roomCode: room.code,
+      activePlayerIndex: room.activePlayerIndex,
+      secondsRemaining: 10,
+    });
   }, 10000);
+
+  // 20-second mark: Send warning, but give +1 second extra grace period (total 21s) before skipping
   room.turnTimer20 = setTimeout(() => {
-    advanceRoomTurnOnTimeout(io, room, activePlayer, false);
+    broadcastToRoom(io, room, {
+      type: "TURN_TIMEOUT_WARNING",
+      roomCode: room.code,
+      activePlayerIndex: room.activePlayerIndex,
+      secondsRemaining: 1,
+    });
+
+    // 1-second grace period buffer: Any action arriving within this 1000ms will be accepted
+    room.turnTimerGrace = setTimeout(() => {
+      advanceRoomTurnOnTimeout(io, room, activePlayer, false);
+    }, 1000);
   }, 20000);
 }
 
@@ -144,6 +181,476 @@ function getSanitizedRoom(room: RoomData): SignalingRoom {
   };
 }
 
+function createInitialGameState(room: RoomData): any {
+  return {
+    mode: "ONLINE",
+    gameStarted: true,
+    activePlayerIndex: 0,
+    diceQueue: [],
+    diceRollCountThisTurn: 0,
+    consecutiveSixesCount: 0,
+    extraRollsCount: 0,
+    hasBustedThisTurn: false,
+    selectedDiceValue: null,
+    winnerColor: null,
+    rankings: [],
+    isTeamUpMode: room.isTeamUpMode,
+    isHomeEntryLockEnabled: room.isHomeEntryLockEnabled,
+    isTokenBlockEnabled: room.isTokenBlockEnabled,
+    players: room.players.map((p) => ({
+      color: p.color,
+      name: p.name,
+      surname: p.surname || "",
+      isBot: Boolean(p.isBot),
+      hasKilledOpponent: false,
+      isActive: p.color === room.players[0].color,
+      rollHistory: [],
+      lastRolledValue: undefined,
+      tokens: [0, 1, 2, 3].map((id) => ({
+        id,
+        color: p.color,
+        state: "BASE",
+        position: -1,
+      })),
+      isOffline: Boolean(p.isOffline),
+      hasQuit: Boolean(p.hasQuit),
+      turnsWithoutSix: 0,
+    })),
+    logs: [`🎮 Online Match Started! ${room.players[0].name} (Red) goes first!`],
+  };
+}
+
+function isTokenPartofJodaOnStandardCell(t: any, player: any): boolean {
+  if (t.state !== "TRACK") return false;
+  const globalIdx = (START_INDEX[t.color as PlayerColor] + t.position) % 52;
+  if (SAFE_INDICES.includes(globalIdx)) return false;
+  const count = (player.tokens || []).filter(
+    (tk: any) => tk.state === "TRACK" && ((START_INDEX[tk.color as PlayerColor] + tk.position) % 52) === globalIdx
+  ).length;
+  return count === 2 || count === 4;
+}
+
+function isPathBlocked(t: any, player: any, val: number, state: any): boolean {
+  if (state.isTokenBlockEnabled === false) return false;
+  if (t.state === "BASE" || t.state === "HOME") return false;
+  const isMovingAsJoda = isTokenPartofJodaOnStandardCell(t, player) && (val % 2 === 0);
+  const stepsToCheck = isMovingAsJoda ? Math.floor(val / 2) : val;
+
+  let stepState = t.state;
+  let stepPos = t.position;
+
+  for (let s = 1; s <= stepsToCheck; s++) {
+    if (stepState === "TRACK") {
+      if (stepPos === 50) {
+        if (state.isHomeEntryLockEnabled === false || player.hasKilledOpponent) {
+          stepState = "HOME_STRETCH";
+          stepPos = 0;
+        } else {
+          stepState = "TRACK";
+          stepPos = 51;
+        }
+      } else if (stepPos === 51) {
+        stepState = "TRACK";
+        stepPos = 0;
+      } else {
+        stepState = "TRACK";
+        stepPos = stepPos + 1;
+      }
+    } else if (stepState === "HOME_STRETCH") {
+      if (stepPos === 4) {
+        stepState = "HOME";
+        stepPos = -1;
+      } else {
+        stepState = "HOME_STRETCH";
+        stepPos = stepPos + 1;
+      }
+    } else if (stepState === "HOME") {
+      return true;
+    }
+
+    if (stepState === "TRACK") {
+      const globalIdx = (START_INDEX[t.color as PlayerColor] + stepPos) % 52;
+      if (!SAFE_INDICES.includes(globalIdx)) {
+        let blockOwnerColor: PlayerColor | null = null;
+        for (const p of state.players || []) {
+          const count = (p.tokens || []).filter(
+            (tk: any) => tk.state === "TRACK" && ((START_INDEX[tk.color as PlayerColor] + tk.position) % 52) === globalIdx
+          ).length;
+          if (count >= 2) {
+            blockOwnerColor = p.color;
+            break;
+          }
+        }
+        if (blockOwnerColor !== null) {
+          if (s < stepsToCheck) return true;
+          if (blockOwnerColor !== t.color && !isMovingAsJoda) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function canTokenMove(t: any, player: any, val: number, state: any): boolean {
+  if (t.state === "HOME") return false;
+  if (t.state === "BASE") {
+    return val === 6;
+  }
+  if (isPathBlocked(t, player, val, state)) return false;
+
+  const isMovingAsJoda = isTokenPartofJodaOnStandardCell(t, player) && (val % 2 === 0);
+  const steps = isMovingAsJoda ? Math.floor(val / 2) : val;
+
+  if (t.state === "TRACK") {
+    if (t.position + steps <= 50) return true;
+    if (t.position + steps === 51) {
+      return state.isHomeEntryLockEnabled !== false && !player.hasKilledOpponent;
+    }
+    if (state.isHomeEntryLockEnabled !== false && !player.hasKilledOpponent) {
+      return true;
+    }
+    const overflow = (t.position + steps) - 51;
+    return overflow <= 5;
+  }
+  if (t.state === "HOME_STRETCH") {
+    return t.position + steps <= 5;
+  }
+  return false;
+}
+
+function getPlayableTokensOnServer(state: any, diceVal?: number): { color: PlayerColor; id: number; diceValue: number }[] {
+  const activePlayer = state.players?.[state.activePlayerIndex];
+  if (!activePlayer || state.winnerColor) return [];
+  const diceValuesToCheck = diceVal !== undefined ? [diceVal] : (state.diceQueue || []);
+  const playable: { color: PlayerColor; id: number; diceValue: number }[] = [];
+
+  for (const val of diceValuesToCheck) {
+    for (const t of activePlayer.tokens || []) {
+      if (canTokenMove(t, activePlayer, val, state)) {
+        playable.push({ color: activePlayer.color, id: t.id, diceValue: val });
+      }
+    }
+    if (state.isTeamUpMode && playable.length === 0) {
+      const teammate = state.players.find((p: any) => areTeammates(p.color, activePlayer.color));
+      if (teammate) {
+        for (const t of teammate.tokens || []) {
+          if (canTokenMove(t, teammate, val, state)) {
+            playable.push({ color: teammate.color, id: t.id, diceValue: val });
+          }
+        }
+      }
+    }
+  }
+  return playable;
+}
+
+function handleServerRollDice(io: Server, room: RoomData, socket: Socket, data: any) {
+  if (!room.gameStarted || room.winnerColor) return;
+  const activePlayer = room.players[room.activePlayerIndex];
+  if (!activePlayer) return;
+
+  if (data.playerId && data.playerId !== activePlayer.id && !activePlayer.isBot) {
+    socket.emit("message", { type: "ERROR", message: "Not your turn!" });
+    return;
+  }
+
+  clearRoomTurnTimer(room);
+
+  if (!room.gameState) {
+    room.gameState = createInitialGameState(room);
+  }
+
+  const gs = room.gameState;
+  const currentConsecutiveSixes = gs.consecutiveSixesCount || 0;
+  const queue = Array.isArray(gs.diceQueue) ? gs.diceQueue : [];
+
+  // Cryptographically random roll between 1 and 6
+  let rollValue = Math.floor(Math.random() * 6) + 1;
+
+  // Respect dry spell pity rule if provided
+  const turnsWithoutSix = data.turnsWithoutSix || 0;
+  if (turnsWithoutSix >= 5 && Math.random() < 0.6) {
+    rollValue = 6;
+  }
+
+  let isBust = false;
+  let nextConsecutiveSixes = currentConsecutiveSixes;
+
+  if (rollValue === 6) {
+    nextConsecutiveSixes += 1;
+    if (nextConsecutiveSixes >= 3) {
+      isBust = true;
+    }
+  } else {
+    nextConsecutiveSixes = 0;
+  }
+
+  gs.consecutiveSixesCount = nextConsecutiveSixes;
+
+  if (gs.players && gs.players[room.activePlayerIndex]) {
+    const p = gs.players[room.activePlayerIndex];
+    p.rollHistory = [...(p.rollHistory || []), rollValue];
+    p.lastRolledValue = rollValue;
+    p.turnsWithoutSix = rollValue === 6 ? 0 : (p.turnsWithoutSix || 0) + 1;
+  }
+
+  if (isBust) {
+    gs.diceQueue = [];
+    gs.selectedDiceValue = null;
+    gs.consecutiveSixesCount = 0;
+    const logMsg = `💥 BUST! ${activePlayer.name} rolled 3 consecutive 6s! Turn passed.`;
+    gs.logs = [logMsg, ...(gs.logs || [])];
+
+    let nextIndex = (room.activePlayerIndex + 1) % room.players.length;
+    let attempts = 0;
+    while (attempts < room.players.length) {
+      const candidate = room.players[nextIndex];
+      if (candidate && !candidate.hasQuit) break;
+      nextIndex = (nextIndex + 1) % room.players.length;
+      attempts++;
+    }
+    room.activePlayerIndex = nextIndex;
+    gs.activePlayerIndex = nextIndex;
+    room.currentSeq = (room.currentSeq || 0) + 1;
+
+    const bustPayload = {
+      type: "DICE_ROLLED",
+      seq: room.currentSeq,
+      roomCode: room.code,
+      playerId: activePlayer.id,
+      color: activePlayer.color,
+      rollValue: 6,
+      diceQueue: [],
+      selectedDiceValue: null,
+      isBust: true,
+      canRollFurther: false,
+      nextActiveIndex: nextIndex,
+      gameState: gs,
+      timestamp: Date.now(),
+    };
+    room.lastAction = bustPayload;
+    room.lastActionTime = Date.now();
+    broadcastToRoom(io, room, bustPayload);
+
+    setTimeout(() => {
+      startRoomTurnTimer(io, room);
+    }, 1200);
+    return;
+  }
+
+  const nextQueue = [...queue, rollValue];
+  gs.diceQueue = nextQueue;
+  const canRollFurther = (rollValue === 6 && nextQueue.length < 3);
+  gs.selectedDiceValue = canRollFurther ? null : (nextQueue[0] || null);
+
+  const playable = getPlayableTokensOnServer(gs, rollValue);
+  const hasValidMove = playable.length > 0;
+
+  room.currentSeq = (room.currentSeq || 0) + 1;
+  const rollPayload = {
+    type: "DICE_ROLLED",
+    seq: room.currentSeq,
+    roomCode: room.code,
+    playerId: activePlayer.id,
+    color: activePlayer.color,
+    rollValue,
+    diceQueue: nextQueue,
+    selectedDiceValue: gs.selectedDiceValue,
+    canRollFurther,
+    consecutiveSixesCount: nextConsecutiveSixes,
+    hasValidMove,
+    gameState: gs,
+    timestamp: Date.now(),
+  };
+
+  room.lastAction = rollPayload;
+  room.lastActionTime = Date.now();
+  broadcastToRoom(io, room, rollPayload);
+
+  if (canRollFurther) {
+    // Multi-roll: Reset timer so player can roll again
+    startRoomTurnTimer(io, room);
+  } else if (!hasValidMove) {
+    // Zero valid moves (e.g. rolled a non-6 with all gotis in BASE):
+    // Wait 1200ms so player sees the roll, then auto-advance
+    setTimeout(() => {
+      if (room.gameState === gs && room.activePlayerIndex === gs.activePlayerIndex && gs.diceQueue.length > 0) {
+        gs.diceQueue = [];
+        gs.selectedDiceValue = null;
+        advanceRoomTurnOnTimeout(io, room, activePlayer, false);
+      }
+    }, 1200);
+  } else {
+    // Player has gotis to move: Full 20s (+1s grace) timer
+    startRoomTurnTimer(io, room);
+  }
+}
+
+function handleServerMoveToken(io: Server, room: RoomData, socket: Socket, data: any) {
+  if (!room.gameStarted || room.winnerColor) return;
+  const activePlayer = room.players[room.activePlayerIndex];
+  if (!activePlayer) return;
+
+  clearRoomTurnTimer(room);
+
+  if (!room.gameState) {
+    room.gameState = createInitialGameState(room);
+  }
+  const gs = room.gameState;
+  const { tokenId, color, diceValue } = data;
+
+  const movingPlayer = (gs.players || []).find((p: any) => p.color === color) || gs.players[gs.activePlayerIndex];
+  if (!movingPlayer) return;
+  const token = (movingPlayer.tokens || []).find((t: any) => t.id === tokenId);
+  if (!token) return;
+
+  let val = diceValue !== undefined ? diceValue : (gs.selectedDiceValue || (gs.diceQueue && gs.diceQueue[0]));
+  if (!val) return;
+
+  const isMovingAsJoda = isTokenPartofJodaOnStandardCell(token, movingPlayer) && (val % 2 === 0);
+  const steps = isMovingAsJoda ? Math.floor(val / 2) : val;
+
+  let newPosition = token.position;
+  let newState = token.state;
+
+  if (token.state === "BASE") {
+    if (val === 6) {
+      newState = "TRACK";
+      newPosition = 0;
+    } else {
+      return;
+    }
+  } else if (token.state === "TRACK") {
+    const targetPos = token.position + steps;
+    if (targetPos <= 50) {
+      newPosition = targetPos;
+    } else if (targetPos === 51) {
+      if (gs.isHomeEntryLockEnabled !== false && !movingPlayer.hasKilledOpponent) {
+        newPosition = 51;
+      } else {
+        newState = "HOME_STRETCH";
+        newPosition = 0;
+      }
+    } else {
+      if (gs.isHomeEntryLockEnabled !== false && !movingPlayer.hasKilledOpponent) {
+        newPosition = (targetPos) % 52;
+      } else {
+        const stretchPos = targetPos - 51;
+        if (stretchPos === 5) {
+          newState = "HOME";
+          newPosition = -1;
+        } else if (stretchPos < 5) {
+          newState = "HOME_STRETCH";
+          newPosition = stretchPos;
+        } else {
+          return;
+        }
+      }
+    }
+  } else if (token.state === "HOME_STRETCH") {
+    const targetPos = token.position + steps;
+    if (targetPos === 5) {
+      newState = "HOME";
+      newPosition = -1;
+    } else if (targetPos < 5) {
+      newPosition = targetPos;
+    } else {
+      return;
+    }
+  }
+
+  token.state = newState;
+  token.position = newPosition;
+
+  let hasKill = false;
+  const killedList: any[] = [];
+  if (newState === "TRACK") {
+    const globalIdx = (START_INDEX[token.color as PlayerColor] + newPosition) % 52;
+    if (!SAFE_INDICES.includes(globalIdx)) {
+      for (const p of gs.players || []) {
+        if (p.color === movingPlayer.color) continue;
+        if (gs.isTeamUpMode && areTeammates(p.color, movingPlayer.color)) continue;
+        const oppTokensOnCell = (p.tokens || []).filter(
+          (t: any) => t.state === "TRACK" && ((START_INDEX[p.color as PlayerColor] + t.position) % 52) === globalIdx
+        );
+        if (oppTokensOnCell.length > 0) {
+          oppTokensOnCell.forEach((kt: any) => {
+            kt.state = "BASE";
+            kt.position = -1;
+            killedList.push({ color: p.color, id: kt.id });
+          });
+          hasKill = true;
+          movingPlayer.hasKilledOpponent = true;
+        }
+      }
+    }
+  }
+
+  if (Array.isArray(gs.diceQueue)) {
+    const qIdx = gs.diceQueue.indexOf(val);
+    if (qIdx !== -1) {
+      gs.diceQueue.splice(qIdx, 1);
+    }
+    gs.selectedDiceValue = gs.diceQueue.length > 1 ? null : (gs.diceQueue[0] || null);
+  }
+
+  const isWinner = (movingPlayer.tokens || []).every((t: any) => t.state === "HOME");
+  if (isWinner) {
+    gs.winnerColor = movingPlayer.color;
+    room.winnerColor = movingPlayer.color;
+    gs.rankings = [movingPlayer.color];
+  }
+
+  const reachedHome = newState === "HOME";
+  const getsBonusRoll = hasKill || reachedHome;
+
+  let nextActiveIndex = room.activePlayerIndex;
+  if (!isWinner) {
+    if (getsBonusRoll) {
+      gs.diceQueue = [];
+      gs.selectedDiceValue = null;
+      startRoomTurnTimer(io, room);
+    } else if (!gs.diceQueue || gs.diceQueue.length === 0) {
+      nextActiveIndex = (room.activePlayerIndex + 1) % room.players.length;
+      let attempts = 0;
+      while (attempts < room.players.length) {
+        const candidate = room.players[nextActiveIndex];
+        if (candidate && !candidate.hasQuit) break;
+        nextActiveIndex = (nextActiveIndex + 1) % room.players.length;
+        attempts++;
+      }
+      room.activePlayerIndex = nextActiveIndex;
+      gs.activePlayerIndex = nextActiveIndex;
+      startRoomTurnTimer(io, room);
+    } else {
+      startRoomTurnTimer(io, room);
+    }
+  }
+
+  room.currentSeq = (room.currentSeq || 0) + 1;
+  const movePayload = {
+    type: "TOKEN_MOVED",
+    seq: room.currentSeq,
+    roomCode: room.code,
+    playerId: activePlayer.id,
+    color,
+    tokenId,
+    usedDiceValue: val,
+    destination: { state: newState, position: newPosition },
+    capturedTokens: killedList,
+    isBonus: getsBonusRoll,
+    nextActiveIndex,
+    winnerColor: gs.winnerColor,
+    rankings: gs.rankings,
+    gameState: gs,
+    timestamp: Date.now(),
+  };
+
+  room.lastAction = movePayload;
+  room.lastActionTime = Date.now();
+  broadcastToRoom(io, room, movePayload);
+}
+
 function handlePlayerDisconnectOrForfeit(io: Server, room: RoomData, playerId: string, isPermanentLeave: boolean = false) {
   const p = room.players.find((player) => player.id === playerId);
   if (!p) return;
@@ -157,25 +664,12 @@ function handlePlayerDisconnectOrForfeit(io: Server, room: RoomData, playerId: s
 
   if (!room.gameStarted || room.winnerColor) return;
 
-  // Only declare winner if player explicitly forfeits OR if permanent leave was confirmed
   if (isPermanentLeave) {
     const activePlayers = room.players.filter((pl) => !pl.hasQuit);
     if (activePlayers.length === 1) {
       const winnerPlayer = activePlayers[0];
       room.winnerColor = winnerPlayer.color;
       clearRoomTurnTimer(room);
-      const updatedPlayers = room.players.map((pl) => {
-        const existing = room.gameState?.players?.find((gp: any) => gp.color === pl.color);
-        return {
-          ...(existing || {
-            color: pl.color,
-            name: pl.name,
-            tokens: [0, 1, 2, 3].map((id) => ({ id, color: pl.color, state: "BASE", position: -1 })),
-          }),
-          isOffline: Boolean(pl.isOffline),
-          hasQuit: Boolean(pl.hasQuit),
-        };
-      });
       const winLog = `👑 ${winnerPlayer.name} is declared the WINNER! Opponent left the match.`;
       const existingLogs = Array.isArray(room.gameState?.logs) ? room.gameState.logs : [];
       room.gameState = {
@@ -183,7 +677,6 @@ function handlePlayerDisconnectOrForfeit(io: Server, room: RoomData, playerId: s
         gameStarted: true,
         winnerColor: winnerPlayer.color,
         rankings: [winnerPlayer.color],
-        players: updatedPlayers,
         logs: [winLog, ...existingLogs],
       };
       room.currentSeq = (room.currentSeq || 0) + 1;
@@ -197,13 +690,6 @@ function handlePlayerDisconnectOrForfeit(io: Server, room: RoomData, playerId: s
         gameState: room.gameState,
         room: getSanitizedRoom(room),
       });
-      broadcastToRoom(io, room, {
-        type: "SYNC_GAME_STATE",
-        roomCode: room.code,
-        seq: room.currentSeq,
-        gameState: room.gameState,
-      });
-      broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: getSanitizedRoom(room) });
 
       setTimeout(() => {
         if (rooms.has(room.code)) {
@@ -215,7 +701,6 @@ function handlePlayerDisconnectOrForfeit(io: Server, room: RoomData, playerId: s
     }
   }
 
-  // If the active player is offline, advance their turn without declaring instant loss
   const currentActivePlayer = room.players[room.activePlayerIndex];
   if (currentActivePlayer && currentActivePlayer.id === playerId) {
     clearRoomTurnTimer(room);
@@ -243,8 +728,13 @@ function advanceRoomTurnOnTimeout(io: Server, room: RoomData, activePlayer: Room
     attempts++;
   }
   room.activePlayerIndex = nextIndex;
+  if (room.gameState) {
+    room.gameState.activePlayerIndex = nextIndex;
+    room.gameState.diceQueue = [];
+    room.gameState.selectedDiceValue = null;
+  }
   room.currentSeq = (room.currentSeq || 0) + 1;
-  const skipPacket: GameActionPacket = {
+  const skipPacket = {
     seq: room.currentSeq,
     type: "TURN_TIMEOUT_SKIP",
     roomCode: room.code,
@@ -252,6 +742,7 @@ function advanceRoomTurnOnTimeout(io: Server, room: RoomData, activePlayer: Room
     color: activePlayer.color,
     nextActiveIndex: nextIndex,
     isOffline: activePlayer.isOffline,
+    gameState: room.gameState,
     timestamp: Date.now(),
   };
   broadcastToRoom(io, room, skipPacket);
@@ -302,21 +793,14 @@ function broadcastQueueUpdate(io: Server) {
     count: activeQueue.length,
     timeLeft,
     totalTime: MATCHMAKING_TIMEOUT,
-    targetTime: matchmakingTargetTime,
-    players: activeQueue.map((qp, idx) => ({
+    players: activeQueue.map((qp) => ({
       id: qp.playerId,
-      name: qp.playerName || `Player ${idx + 1}`,
+      name: qp.playerName,
       surname: qp.playerSurname || "",
     })),
   };
-  for (const qp of activeQueue) {
-    io.to(qp.socketId).emit("message", payload);
-  }
+  io.emit("message", payload);
 }
-
-const COLOR_ORDER_2_PLAYERS: PlayerColor[] = ["RED", "YELLOW"];
-const COLOR_ORDER_3_PLAYERS: PlayerColor[] = ["RED", "YELLOW", "GREEN"];
-const COLOR_ORDER_4_PLAYERS: PlayerColor[] = ["RED", "YELLOW", "GREEN", "BLUE"];
 
 function generateRoomCode(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -373,6 +857,7 @@ function launchAutoMatch(io: Server, batch: QueuePlayer[]) {
     disconnectTimers: new Map(),
   };
 
+  newRoom.gameState = createInitialGameState(newRoom);
   rooms.set(roomCode, newRoom);
   const sanitized = getSanitizedRoom(newRoom);
 
@@ -381,17 +866,23 @@ function launchAutoMatch(io: Server, batch: QueuePlayer[]) {
     qp.socket.data = qp.socket.data || {};
     qp.socket.data.roomCode = roomCode;
     qp.socket.data.playerId = qp.playerId;
-    // Send direct event to ensure no packet is missed
     qp.socket.emit("message", {
       type: "GAME_STARTED",
       room: sanitized,
       yourColor: assignedColors[idx],
       isAutoMatch: true,
       realCount,
+      gameState: newRoom.gameState,
     });
   });
 
-  broadcastToRoom(io, newRoom, { type: "GAME_STARTED", room: sanitized, isAutoMatch: true, realCount });
+  broadcastToRoom(io, newRoom, {
+    type: "GAME_STARTED",
+    room: sanitized,
+    isAutoMatch: true,
+    realCount,
+    gameState: newRoom.gameState,
+  });
   startRoomTurnTimer(io, newRoom);
 }
 
@@ -448,14 +939,14 @@ async function startServer() {
   app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
     if (req.method === "OPTIONS") return res.sendStatus(200);
     next();
   });
   app.use(express.json());
 
   app.get("/api/info", (_req, res) => {
-    res.json({ service: "Ludo Multiplayer Socket.io Server", status: "running", activeRooms: rooms.size, uptime: process.uptime() });
+    res.json({ service: "Ludo Server-Authoritative Socket.io Server", status: "running", activeRooms: rooms.size, uptime: process.uptime() });
   });
   app.get("/api/health", (_req, res) => {
     res.json({ status: "ok", activeRooms: rooms.size });
@@ -466,7 +957,7 @@ async function startServer() {
       minSupportedVersion: "1.0.1",
       minRequiredVersion: "1.0.1",
       updateUrl: "https://strategizestudio-commits.github.io/ludo-strategize/",
-      releaseNotes: "Optimized online multiplayer with Socket.io",
+      releaseNotes: "Server-authoritative smooth online multiplayer",
     });
   });
   app.get("/api/rooms/:code", (req, res) => {
@@ -510,7 +1001,7 @@ async function startServer() {
   const server = http.createServer(app);
   const io = new Server(server, {
     cors: { origin: "*" },
-    pingInterval: 10000,
+    pingInterval: 8000,
     pingTimeout: 10000,
   });
 
@@ -608,7 +1099,6 @@ async function startServer() {
           socket.emit("message", {
             type: "ROOM_CREATED",
             room: getSanitizedRoom(newRoom),
-            yourColor: "RED",
           });
           return;
         }
@@ -616,17 +1106,35 @@ async function startServer() {
         if (type === "JOIN_ROOM") {
           const { roomCode, playerId, playerName, playerSurname } = data;
           if (!roomCode || !playerId) {
-            socket.emit("message", { type: "ERROR", message: "Invalid room code or player ID" });
+            socket.emit("message", { type: "ERROR", message: "Invalid parameters." });
             return;
           }
           const code = roomCode.trim().toUpperCase();
           const room = rooms.get(code);
           if (!room) {
-            socket.emit("message", { type: "ERROR", message: "Room not found. Check the 6-digit code." });
+            socket.emit("message", { type: "ERROR", message: "Room not found. Check the code." });
             return;
           }
           if (room.gameStarted) {
-            socket.emit("message", { type: "ERROR", message: "Game already started in this room." });
+            const existingPlayer = room.players.find((p) => p.id === playerId);
+            if (existingPlayer) {
+              existingPlayer.socketId = socket.id;
+              existingPlayer.isOffline = false;
+              existingPlayer.hasQuit = false;
+              socket.join(code);
+              currentRoomCode = code;
+              currentPlayerId = playerId;
+              const sanitized = getSanitizedRoom(room);
+              socket.emit("message", { type: "REJOIN_SUCCESS", room: sanitized, yourColor: existingPlayer.color, gameState: room.gameState, lastAction: room.lastAction });
+              broadcastToRoom(io, room, { type: "PLAYER_RECONNECTED", playerId: existingPlayer.id, color: existingPlayer.color, name: existingPlayer.name, room: sanitized });
+              return;
+            }
+            socket.emit("message", { type: "ERROR", message: "Match is already in progress." });
+            return;
+          }
+
+          if (room.players.length >= 4) {
+            socket.emit("message", { type: "ERROR", message: "Room is already full." });
             return;
           }
 
@@ -641,11 +1149,6 @@ async function startServer() {
             const sanitized = getSanitizedRoom(room);
             broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: sanitized });
             socket.emit("message", { type: "JOIN_SUCCESS", room: sanitized, yourColor: existingPlayer.color });
-            return;
-          }
-
-          if (room.players.length >= 4) {
-            socket.emit("message", { type: "ERROR", message: "Room is already full (Max 4 Players)." });
             return;
           }
 
@@ -720,8 +1223,13 @@ async function startServer() {
           room.currentSeq = 0;
           room.activePlayerIndex = 0;
           room.playerMissedTurns = new Map();
+          room.gameState = createInitialGameState(room);
 
-          broadcastToRoom(io, room, { type: "GAME_STARTED", room: getSanitizedRoom(room) });
+          broadcastToRoom(io, room, {
+            type: "GAME_STARTED",
+            room: getSanitizedRoom(room),
+            gameState: room.gameState,
+          });
           startRoomTurnTimer(io, room);
           return;
         }
@@ -741,6 +1249,7 @@ async function startServer() {
                   yourColor: p.color,
                   room: getSanitizedRoom(room),
                   gameState: room.gameState,
+                  lastAction: room.lastAction,
                 });
                 break;
               }
@@ -784,6 +1293,25 @@ async function startServer() {
           return;
         }
 
+        // --- SERVER-AUTHORITATIVE DICE ROLL & TOKEN MOVEMENT HANDLERS ---
+        if (type === "REQUEST_ROLL_DICE" || type === "ROLL_DICE") {
+          const targetCode = data.roomCode || currentRoomCode;
+          if (!targetCode) return;
+          const room = rooms.get(targetCode.toUpperCase());
+          if (!room) return;
+          handleServerRollDice(io, room, socket, data);
+          return;
+        }
+
+        if (type === "REQUEST_MOVE_TOKEN" || type === "MOVE_PAWN") {
+          const targetCode = data.roomCode || currentRoomCode;
+          if (!targetCode) return;
+          const room = rooms.get(targetCode.toUpperCase());
+          if (!room) return;
+          handleServerMoveToken(io, room, socket, data);
+          return;
+        }
+
         if (type === "FORFEIT_MATCH" || type === "forfeit_match" || type === "LEAVE_MATCH") {
           const targetCode = data.roomCode || currentRoomCode;
           const targetPlayerId = data.playerId || currentPlayerId;
@@ -813,7 +1341,7 @@ async function startServer() {
           return;
         }
 
-        if (type === "ROLL_DICE" || type === "MOVE_PAWN" || type === "FULL_BOARD_STATE" || type === "SYNC_GAME_STATE" || type === "GAME_ACTION") {
+        if (type === "FULL_BOARD_STATE" || type === "SYNC_GAME_STATE" || type === "GAME_ACTION") {
           const { roomCode, playerId, gameState, seq } = data;
           if (!roomCode) return;
           const room = rooms.get(roomCode.toUpperCase());
@@ -827,58 +1355,9 @@ async function startServer() {
           }
           data.timestamp = Date.now();
 
-          // Save last action for instant replay on reconnect
-          if (type === "ROLL_DICE" || type === "MOVE_PAWN") {
-            room.lastAction = data;
-            room.lastActionTime = Date.now();
-          }
-
-          if (type === "ROLL_DICE") {
-            // Give active player fresh 20 seconds to move their token!
-            startRoomTurnTimer(io, room);
-            // Authoritative dice queue update on server
-            if (room.gameState) {
-              const rollVal = Number(data.rollValue) || 1;
-              const prevQueue = Array.isArray(room.gameState.diceQueue) ? room.gameState.diceQueue : [];
-              room.gameState.diceQueue = [...prevQueue, rollVal];
-              room.gameState.selectedDiceValue = (rollVal === 6 ? null : rollVal);
-              if (Array.isArray(room.gameState.players) && room.gameState.players[room.activePlayerIndex]) {
-                room.gameState.players[room.activePlayerIndex].lastRolledValue = rollVal;
-              }
-            }
-          }
-
           if (gameState) {
-            // Prevent stale empty diceQueue from wiping active roll on ROLL_DICE
-            if (type === "ROLL_DICE" && (!gameState.diceQueue || gameState.diceQueue.length === 0)) {
-              gameState.diceQueue = [Number(data.rollValue) || 1];
-              gameState.selectedDiceValue = (Number(data.rollValue) === 6 ? null : (Number(data.rollValue) || 1));
-            }
             room.gameState = gameState;
-            if (gameState.winnerColor) {
-              room.winnerColor = gameState.winnerColor;
-              clearRoomTurnTimer(room);
-              setTimeout(() => {
-                if (rooms.has(room.code)) {
-                  clearRoomTurnTimer(room);
-                  rooms.delete(room.code);
-                }
-              }, 5000);
-            } else if (typeof gameState.activePlayerIndex === "number") {
-              if (gameState.activePlayerIndex !== room.activePlayerIndex) {
-                room.activePlayerIndex = gameState.activePlayerIndex;
-                startRoomTurnTimer(io, room);
-              }
-            }
           }
-
-          // Direct ACK confirmation back to sender
-          socket.emit("message", {
-            type: "ACTION_ACK",
-            actionType: type,
-            seq: data.seq,
-          });
-
           broadcastToRoom(io, room, data);
           return;
         }
@@ -888,7 +1367,6 @@ async function startServer() {
           if (!roomCode) return;
           const room = rooms.get(roomCode.toUpperCase());
           if (!room) return;
-          // Send authoritative full board state snapshot
           socket.emit("message", {
             type: "FULL_BOARD_STATE",
             roomCode,
@@ -940,9 +1418,8 @@ async function startServer() {
         if (room) {
           if (!room.gameStarted) {
             room.players = room.players.filter((p) => p.id !== currentPlayerId);
-            if (room.players.length === 0) {
-              rooms.delete(currentRoomCode);
-            } else {
+            if (room.players.length === 0) rooms.delete(currentRoomCode);
+            else {
               if (room.hostId === currentPlayerId) {
                 room.hostId = room.players[0].id;
                 room.players[0].isCreator = true;
@@ -950,51 +1427,31 @@ async function startServer() {
               broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: getSanitizedRoom(room) });
             }
           } else {
-            // 20 seconds grace period before marking player offline / forfeit as requested
-            if (!room.disconnectTimers) room.disconnectTimers = new Map();
-            if (room.disconnectTimers.has(currentPlayerId)) {
-              clearTimeout(room.disconnectTimers.get(currentPlayerId)!);
+            // 30-second grace period before marking player permanently forfeit
+            const p = room.players.find((player) => player.id === currentPlayerId);
+            if (p) {
+              p.isOffline = true;
+              const sanitized = getSanitizedRoom(room);
+              broadcastToRoom(io, room, { type: "PLAYER_OFFLINE", playerId: p.id, color: p.color, name: p.name, room: sanitized });
+
+              const timer = setTimeout(() => {
+                if (rooms.has(currentRoomCode!)) {
+                  handlePlayerDisconnectOrForfeit(io, room, currentPlayerId!, true);
+                }
+              }, 30000);
+              room.disconnectTimers.set(currentPlayerId, timer);
             }
-            const timer = setTimeout(() => {
-              if (rooms.has(room.code)) {
-                handlePlayerDisconnectOrForfeit(io, room, currentPlayerId!, false);
-              }
-            }, 20000); // 20 seconds grace timing
-            room.disconnectTimers.set(currentPlayerId, timer);
           }
         }
       }
     });
   });
 
-  const publicPath = path.join(process.cwd(), "public");
-  app.use(express.static(publicPath));
-
-  if (process.env.NODE_ENV !== "production") {
-    try {
-      const { createServer: createViteServer } = await import("vite");
-      const vite = await createViteServer({
-        server: { middlewareMode: true },
-        appType: "spa",
-      });
-      app.use(vite.middlewares);
-    } catch {}
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    const indexPath = path.join(distPath, "index.html");
-    app.use(express.static(distPath));
-    app.get("*", (_req, res) => {
-      if (fs.existsSync(indexPath)) {
-        res.sendFile(indexPath);
-      } else {
-        res.json({ service: "Ludo Multiplayer Socket.io Server", status: "running" });
-      }
-    });
-  }
-
   server.listen(PORT, "0.0.0.0", () => {
-    console.log(`[SERVER] Standalone Ludo Socket.io Server listening on port ${PORT}`);
+    console.log(`[Ludo Standalone Server] Running on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error("[Ludo Server Init Error]:", err);
+});
