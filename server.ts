@@ -353,13 +353,39 @@ function advanceRoomTurnOnTimeout(room: RoomData, activePlayer: RoomPlayer, isAl
     }
   }
 
-  // Find next active player (skip quit players)
+  // Find next active & eligible player (skip quit players, and skip all-HOME players unless Team Up teammate still has tokens)
+  const getTeammateColor = (c: string) => {
+    if (c === "RED") return "YELLOW";
+    if (c === "YELLOW") return "RED";
+    if (c === "GREEN") return "BLUE";
+    if (c === "BLUE") return "GREEN";
+    return c;
+  };
+  const statePlayers: any[] = Array.isArray(room.gameState?.players) ? room.gameState.players : [];
+  const isTeamUpMode = Boolean(room.isTeamUpMode || room.gameState?.isTeamUpMode);
+
   let nextIndex = (room.activePlayerIndex + 1) % room.players.length;
   let attempts = 0;
   while (attempts < room.players.length) {
     const candidate = room.players[nextIndex];
     if (candidate && !candidate.hasQuit) {
-      break;
+      const stateCandidate = statePlayers.find((sp) => sp.color === candidate.color);
+      const allHome = stateCandidate && Array.isArray(stateCandidate.tokens)
+        ? stateCandidate.tokens.every((t: any) => t.state === "HOME")
+        : false;
+      if (!allHome) {
+        break;
+      }
+      if (isTeamUpMode) {
+        const tmColor = getTeammateColor(candidate.color);
+        const tmState = statePlayers.find((sp) => sp.color === tmColor);
+        const tmAllHome = tmState && Array.isArray(tmState.tokens)
+          ? tmState.tokens.every((t: any) => t.state === "HOME")
+          : true;
+        if (!tmAllHome) {
+          break;
+        }
+      }
     }
     nextIndex = (nextIndex + 1) % room.players.length;
     attempts++;
@@ -633,9 +659,14 @@ function broadcastToRoom(room: RoomData, message: object) {
 
 async function startServer() {
   const app = express();
-  const portArgIndex = process.argv.indexOf("--port");
+  const portArgIndex = process.argv.lastIndexOf("--port");
   const cliPort = portArgIndex !== -1 ? parseInt(process.argv[portArgIndex + 1], 10) : null;
-  const PORT = cliPort || (process.env.PORT ? parseInt(process.env.PORT, 10) : 3000);
+  const envPort =
+    process.env.PORT && (!process.env.NGINX_PORT || process.env.PORT !== process.env.NGINX_PORT)
+      ? parseInt(process.env.PORT, 10)
+      : null;
+  const defaultPort = process.env.DEFAULT_APP_PORT ? parseInt(process.env.DEFAULT_APP_PORT, 10) : 3000;
+  const PORT = (cliPort && !Number.isNaN(cliPort)) ? cliPort : (envPort && !Number.isNaN(envPort) ? envPort : defaultPort);
 
   // CORS Middleware for Render & cross-origin frontend requests
   app.use((req, res, next) => {
