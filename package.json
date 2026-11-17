@@ -1,6 +1,6 @@
 {
   "name": "ludo-backend-server",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Standalone WebSocket & REST backend for Ludo Strategize multiplayer",
   "main": "server.ts",
   "scripts": {
