@@ -1,14 +1,14 @@
 /**
- * @license
- * STANDALONE LUDO MULTIPLAYER SOCKET.IO & HTTP SERVER
- * SERVER-AUTHORITATIVE ARCHITECTURE WITH OFFLINE PACKET BUFFERING,
- * SERVER-DRIVEN TURNS, +1S GRACE PERIOD & INSTANT REJOIN RECOVERY
+ * STANDALONE LUDO MULTIPLAYER WEBSOCKET & HTTP SERVER
+ * 
+ * Ready to run directly on Render, Railway, Heroku, or VPS.
+ * Port is read dynamically from process.env.PORT (Render sets this automatically).
  */
+
 import express from "express";
-import fs from "fs";
 import http from "http";
 import path from "path";
-import { Server, Socket } from "socket.io";
+import { WebSocketServer, WebSocket } from "ws";
 
 export type PlayerColor = "RED" | "GREEN" | "YELLOW" | "BLUE";
 
@@ -21,7 +21,8 @@ export interface RoomPlayer {
   isBot?: boolean;
   isOffline?: boolean;
   hasQuit?: boolean;
-  socketId?: string;
+  ws?: WebSocket;
+  isAlive?: boolean;
 }
 
 export interface SignalingRoom {
@@ -41,27 +42,29 @@ export interface SignalingRoom {
   isTokenBlockEnabled: boolean;
   gameStarted: boolean;
   gameState?: any;
+  currentSeq?: number;
   createdAt: number;
 }
 
 export interface GameActionPacket {
   seq: number;
+  clientActionId?: string;
   type: string;
   roomCode: string;
   playerId?: string;
   color?: PlayerColor;
   rollValue?: number;
+  turnsWithoutSix?: number;
   tokenId?: number;
   forceDiceValue?: number;
   lastActionSequenceId?: number;
+  fullSync?: boolean;
   gameState?: any;
+  missingSeqs?: number[];
+  packets?: GameActionPacket[];
   nextActiveIndex?: number;
   isOffline?: boolean;
   timestamp?: number;
-  giftId?: string;
-  senderColor?: PlayerColor;
-  receiverColor?: PlayerColor;
-  turnsWithoutSix?: number;
 }
 
 interface RoomData {
@@ -76,87 +79,520 @@ interface RoomData {
   winnerColor?: string | null;
   createdAt: number;
   currentSeq: number;
+  actionRingBuffer: GameActionPacket[];
+  processedClientActionIds: Set<string>;
   activePlayerIndex: number;
-  lastAction?: any;
-  lastActionTime?: number;
   turnTimer10?: NodeJS.Timeout | null;
   turnTimer20?: NodeJS.Timeout | null;
-  turnTimerGrace?: NodeJS.Timeout | null;
+  turnTimer23?: NodeJS.Timeout | null;
   playerMissedTurns: Map<string, number>;
-  disconnectTimers: Map<string, NodeJS.Timeout>;
 }
 
+// Per-socket session tracking (works across lobby, auto-match, and rejoin)
+const wsSessions = new WeakMap<WebSocket, { roomCode: string | null; playerId: string | null }>();
+
+function getWsSession(ws: WebSocket): { roomCode: string | null; playerId: string | null } {
+  return wsSessions.get(ws) || { roomCode: null, playerId: null };
+}
+
+function setWsSession(ws: WebSocket | undefined, roomCode: string | null, playerId: string | null) {
+  if (!ws) return;
+  wsSessions.set(ws, { roomCode, playerId });
+}
+
+// In-Memory Room Store
 const rooms = new Map<string, RoomData>();
 
-// Constants for track navigation
-const START_INDEX: Record<PlayerColor, number> = {
-  RED: 0,
-  GREEN: 13,
-  YELLOW: 26,
-  BLUE: 39,
-};
+// --- RING BUFFER & RELAY TIMEOUT HELPERS ---
+function pushActionToRingBuffer(room: RoomData, packet: any) {
+  if (!room.actionRingBuffer) {
+    room.actionRingBuffer = [];
+  }
+  room.actionRingBuffer.push(packet);
+  if (room.actionRingBuffer.length > 100) {
+    room.actionRingBuffer.shift(); // Keep latest 100 sequential packets for retransmission
+  }
+}
 
-const SAFE_INDICES = [0, 8, 13, 21, 26, 34, 39, 47];
-
-const COLOR_ORDER_2_PLAYERS: PlayerColor[] = ["RED", "YELLOW"];
-const COLOR_ORDER_3_PLAYERS: PlayerColor[] = ["RED", "GREEN", "YELLOW"];
-const COLOR_ORDER_4_PLAYERS: PlayerColor[] = ["RED", "GREEN", "YELLOW", "BLUE"];
-
-function areTeammates(c1: PlayerColor, c2: PlayerColor): boolean {
-  if ((c1 === "RED" && c2 === "YELLOW") || (c1 === "YELLOW" && c2 === "RED")) return true;
-  if ((c1 === "GREEN" && c2 === "BLUE") || (c1 === "BLUE" && c2 === "GREEN")) return true;
-  return false;
+function createInitialGameState(room: RoomData) {
+  return {
+    mode: "ONLINE",
+    gameStarted: true,
+    winnerColor: null,
+    rankings: [],
+    activePlayerIndex: 0,
+    diceQueue: [],
+    diceRollCountThisTurn: 0,
+    consecutiveSixesCount: 0,
+    extraRollsCount: 0,
+    isBonusRolling: false,
+    safeDiceQueue: [],
+    bonusConsecutiveSixesCount: 0,
+    hasBustedThisTurn: false,
+    selectedDiceValue: null,
+    isTeamUpMode: room.isTeamUpMode,
+    isHomeEntryLockEnabled: room.isHomeEntryLockEnabled,
+    isTokenBlockEnabled: room.isTokenBlockEnabled,
+    players: room.players.map((p, idx) => ({
+      color: p.color,
+      name: p.name,
+      surname: p.surname || "",
+      isBot: Boolean(p.isBot),
+      isOffline: Boolean(p.isOffline),
+      hasQuit: Boolean(p.hasQuit),
+      hasKilledOpponent: false,
+      tokens: [0, 1, 2, 3].map((id) => ({
+        id,
+        color: p.color,
+        state: "BASE",
+        position: -1,
+      })),
+      isActive: idx === 0,
+      rollHistory: [],
+      lastRolledValue: 6,
+      turnsWithoutSix: 0,
+    })),
+    logs: [`🎮 Online Ludo Match Started with ${room.players.length} Warriors!`],
+  };
 }
 
 function clearRoomTurnTimer(room: RoomData) {
-  if (room.turnTimer10) { clearTimeout(room.turnTimer10); room.turnTimer10 = null; }
-  if (room.turnTimer20) { clearTimeout(room.turnTimer20); room.turnTimer20 = null; }
-  if (room.turnTimerGrace) { clearTimeout(room.turnTimerGrace); room.turnTimerGrace = null; }
+  if (room.turnTimer10) {
+    clearTimeout(room.turnTimer10);
+    room.turnTimer10 = null;
+  }
+  if (room.turnTimer20) {
+    clearTimeout(room.turnTimer20);
+    room.turnTimer20 = null;
+  }
+  if (room.turnTimer23) {
+    clearTimeout(room.turnTimer23);
+    room.turnTimer23 = null;
+  }
 }
 
-function startRoomTurnTimer(io: Server, room: RoomData) {
+function startRoomTurnTimer(room: RoomData) {
   clearRoomTurnTimer(room);
   if (!room.gameStarted || room.winnerColor) return;
+
   const activeIndex = room.activePlayerIndex ?? 0;
   const activePlayer = room.players[activeIndex];
   if (!activePlayer) return;
 
   const isOffline = activePlayer.isOffline || activePlayer.hasQuit;
+
   if (isOffline) {
-    room.turnTimer20 = setTimeout(() => {
-      advanceRoomTurnOnTimeout(io, room, activePlayer, true);
-    }, 1500);
+    // Fast 1s auto-skip for Offline/Quit players
+    room.turnTimer23 = setTimeout(() => {
+      advanceRoomTurnOnTimeout(room, activePlayer, true);
+    }, 1000);
     return;
   }
 
-  // 10-second ping to notify client half time
+  // 10s Silent Ping Check
   room.turnTimer10 = setTimeout(() => {
-    broadcastToRoom(io, room, {
-      type: "TURN_PING",
-      roomCode: room.code,
-      activePlayerIndex: room.activePlayerIndex,
-      secondsRemaining: 10,
-    });
+    if (activePlayer.ws && activePlayer.ws.readyState === WebSocket.OPEN) {
+      try {
+        activePlayer.ws.send(
+          JSON.stringify({
+            type: "TURN_PING",
+            seq: room.currentSeq,
+            timeElapsed: 10,
+            secondsRemaining: 10,
+          })
+        );
+      } catch (err) {}
+    }
   }, 10000);
 
-  // 20-second mark: Send warning, but give +1 second extra grace period (total 21s) before skipping
+  // 20s Warning Ping Check
   room.turnTimer20 = setTimeout(() => {
-    broadcastToRoom(io, room, {
-      type: "TURN_TIMEOUT_WARNING",
-      roomCode: room.code,
-      activePlayerIndex: room.activePlayerIndex,
-      secondsRemaining: 1,
-    });
-
-    // 1-second grace period buffer: Any action arriving within this 1000ms will be accepted
-    room.turnTimerGrace = setTimeout(() => {
-      advanceRoomTurnOnTimeout(io, room, activePlayer, false);
-    }, 1000);
+    if (activePlayer.ws && activePlayer.ws.readyState === WebSocket.OPEN) {
+      try {
+        activePlayer.ws.send(
+          JSON.stringify({
+            type: "TURN_PING",
+            seq: room.currentSeq,
+            timeElapsed: 20,
+            secondsRemaining: 2,
+          })
+        );
+      } catch (err) {}
+    }
   }, 20000);
+
+  // 23s Authoritative Server Skip Buffer (20s client + 3s network grace margin)
+  room.turnTimer23 = setTimeout(() => {
+    advanceRoomTurnOnTimeout(room, activePlayer, false);
+  }, 23000);
 }
 
-function broadcastToRoom(io: Server, room: RoomData, message: object) {
-  io.to(room.code).emit("message", message);
+function handlePlayerDisconnectOrForfeit(room: RoomData, playerId: string, isPermanentLeave: boolean = false) {
+  const p = room.players.find((player) => player.id === playerId);
+  if (!p) return;
+
+  p.isOffline = true;
+  if (isPermanentLeave) {
+    p.hasQuit = true;
+  }
+
+  const sanitized = getSanitizedRoom(room);
+  broadcastToRoom(room, {
+    type: "ROOM_UPDATED",
+    room: sanitized,
+  });
+  broadcastToRoom(room, {
+    type: "PLAYER_OFFLINE",
+    playerId: p.id,
+    color: p.color,
+    name: p.name,
+    room: sanitized,
+  });
+
+  // Check if game has started and winner is not already declared
+  if (!room.gameStarted || room.winnerColor) {
+    return;
+  }
+
+  // Count remaining active (not quit and not offline) players
+  const activePlayers = room.players.filter((pl) => !pl.hasQuit && !pl.isOffline);
+
+  // RULE: Winner is declared ONLY when exactly 1 active player remains in the match
+  if (activePlayers.length === 1) {
+    const winnerPlayer = activePlayers[0];
+    room.winnerColor = winnerPlayer.color;
+    clearRoomTurnTimer(room);
+
+    // Synchronize game state with winner
+    const updatedPlayers = room.players.map((pl) => {
+      const existing = room.gameState?.players?.find((gp: any) => gp.color === pl.color);
+      return {
+        ...(existing || {
+          color: pl.color,
+          name: pl.name,
+          tokens: [0, 1, 2, 3].map((id) => ({ id, color: pl.color, state: "BASE", position: -1 })),
+        }),
+        isOffline: Boolean(pl.isOffline),
+        hasQuit: Boolean(pl.hasQuit),
+      };
+    });
+
+    const winLog = `🏆 CONGRATULATIONS! ${winnerPlayer.name} is declared the WINNER as opponent disconnected / left the match!`;
+    const existingLogs = Array.isArray(room.gameState?.logs) ? room.gameState.logs : [];
+
+    room.gameState = {
+      ...(room.gameState || {}),
+      gameStarted: true,
+      winnerColor: winnerPlayer.color,
+      rankings: [winnerPlayer.color],
+      players: updatedPlayers,
+      logs: [winLog, ...existingLogs],
+    };
+
+    room.currentSeq = (room.currentSeq || 0) + 1;
+
+    // 1. Send WINNER_DECLARED to the remaining player
+    broadcastToRoom(room, {
+      type: "WINNER_DECLARED",
+      roomCode: room.code,
+      winnerColor: winnerPlayer.color,
+      winnerName: winnerPlayer.name,
+      reason: "OPPONENT_OFFLINE",
+      gameState: room.gameState,
+      room: getSanitizedRoom(room),
+    });
+
+    // 2. Send SYNC_GAME_STATE so all client state synchronizes seamlessly
+    broadcastToRoom(room, {
+      type: "SYNC_GAME_STATE",
+      roomCode: room.code,
+      seq: room.currentSeq,
+      gameState: room.gameState,
+    });
+
+    // 3. Send ROOM_UPDATED
+    broadcastToRoom(room, {
+      type: "ROOM_UPDATED",
+      room: getSanitizedRoom(room),
+    });
+
+    // 4. Server Room Deletion strictly AFTER Winner Declaration:
+    setTimeout(() => {
+      if (rooms.has(room.code)) {
+        clearRoomTurnTimer(room);
+        rooms.delete(room.code);
+      }
+    }, 5000);
+  } else if (activePlayers.length === 0) {
+    // All players left -> delete room immediately
+    clearRoomTurnTimer(room);
+    rooms.delete(room.code);
+  } else {
+    // 2 or more active players remain in match! Match continues seamlessly!
+    // If the player who just left/went offline was the current active player, immediately advance turn to next active player
+    const currentActivePlayer = room.players[room.activePlayerIndex];
+    if (currentActivePlayer && currentActivePlayer.id === playerId) {
+      clearRoomTurnTimer(room);
+      advanceRoomTurnOnTimeout(room, currentActivePlayer, true);
+    }
+  }
+}
+
+function advanceRoomTurnOnTimeout(room: RoomData, activePlayer: RoomPlayer, isAlreadyOffline: boolean) {
+  clearRoomTurnTimer(room);
+  if (!room.gameStarted || room.winnerColor) return;
+
+  if (!isAlreadyOffline) {
+    const currentMisses = (room.playerMissedTurns.get(activePlayer.id) || 0) + 1;
+    room.playerMissedTurns.set(activePlayer.id, currentMisses);
+
+    if (currentMisses >= 3) {
+      handlePlayerDisconnectOrForfeit(room, activePlayer.id, false);
+      // handlePlayerDisconnectOrForfeit already declares a winner or advances the active player's turn
+      return;
+    }
+  }
+
+  // Find next active player (skip quit players)
+  let nextIndex = (room.activePlayerIndex + 1) % room.players.length;
+  let attempts = 0;
+  while (attempts < room.players.length) {
+    const candidate = room.players[nextIndex];
+    if (candidate && !candidate.hasQuit) {
+      break;
+    }
+    nextIndex = (nextIndex + 1) % room.players.length;
+    attempts++;
+  }
+
+  room.activePlayerIndex = nextIndex;
+  room.currentSeq = (room.currentSeq || 0) + 1;
+
+  const skipPacket: GameActionPacket = {
+    seq: room.currentSeq,
+    type: "TURN_TIMEOUT_SKIP",
+    roomCode: room.code,
+    playerId: activePlayer.id,
+    color: activePlayer.color,
+    nextActiveIndex: nextIndex,
+    isOffline: activePlayer.isOffline,
+    timestamp: Date.now(),
+  };
+
+  pushActionToRingBuffer(room, skipPacket);
+  broadcastToRoom(room, skipPacket);
+
+  // Start timer for the next active player
+  startRoomTurnTimer(room);
+}
+
+// 40 realistic English names for opponents in online matchmaking
+const OPPONENT_NAMES = [
+  "Oliver", "Emma", "Liam", "Olivia", "Noah",
+  "Ava", "Ethan", "Sophia", "Mason", "Isabella",
+  "William", "Mia", "James", "Charlotte", "Benjamin",
+  "Amelia", "Lucas", "Harper", "Alexander", "Evelyn",
+  "Daniel", "Emily", "Henry", "Abigail", "Michael",
+  "Ella", "Jackson", "Scarlett", "Sebastian", "Grace",
+  "Jack", "Chloe", "Aiden", "Victoria", "Matthew",
+  "Lily", "Samuel", "Zoe", "David", "Luna"
+];
+
+// Helper to get random distinct names from OPPONENT_NAMES
+function getRandomOpponentNames(count: number, excludeNames: string[] = []): string[] {
+  const available = OPPONENT_NAMES.filter((n) => !excludeNames.includes(n));
+  // Shuffle array
+  for (let i = available.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const temp = available[i];
+    available[i] = available[j];
+    available[j] = temp;
+  }
+  return available.slice(0, count);
+}
+
+// --- GLOBAL AUTO MATCHMAKING QUEUE (60 SECONDS TIMEOUT) ---
+interface QueuePlayer {
+  ws: WebSocket;
+  playerId: string;
+  playerName: string;
+  playerSurname?: string;
+  joinedAt: number;
+}
+
+let activeQueue: QueuePlayer[] = [];
+let matchmakingTimerInterval: NodeJS.Timeout | null = null;
+let matchmakingCountdown = 60;
+const MATCHMAKING_TIMEOUT = 60;
+
+function broadcastQueueUpdate() {
+  const payload = JSON.stringify({
+    type: "QUEUE_UPDATE",
+    count: activeQueue.length,
+    timeLeft: matchmakingCountdown,
+    totalTime: MATCHMAKING_TIMEOUT,
+    players: activeQueue.map((qp, idx) => ({
+      id: qp.playerId,
+      name: qp.playerName || `Player ${idx + 1}`,
+      surname: qp.playerSurname || "",
+    })),
+  });
+  for (const qp of activeQueue) {
+    if (qp.ws && qp.ws.readyState === WebSocket.OPEN) {
+      try {
+        qp.ws.send(payload);
+      } catch (err) {
+        console.error("[WS] Error sending queue update:", err);
+      }
+    }
+  }
+}
+
+function launchAutoMatch(batch: QueuePlayer[]) {
+  if (batch.length === 0) return;
+
+  // Case 1: 1 Player Only (60s timer elapsed with no real opponent)
+  // ZERO SERVER LOAD CLIENT-SIDE BOT: No room created, no socket timers, no server state syncing.
+  if (batch.length === 1) {
+    const singlePlayer = batch[0];
+    const assignedOpponentNames = getRandomOpponentNames(1, [singlePlayer.playerName]);
+    const opponentName = assignedOpponentNames[0] || "Oliver";
+
+    if (singlePlayer.ws && singlePlayer.ws.readyState === WebSocket.OPEN) {
+      try {
+        singlePlayer.ws.send(
+          JSON.stringify({
+            type: "START_LOCAL_VIRTUAL_MATCH",
+            yourColor: "RED",
+            opponent: {
+              name: opponentName,
+              color: "YELLOW",
+            },
+          })
+        );
+      } catch (err) {
+        console.error("[WS] Error sending START_LOCAL_VIRTUAL_MATCH:", err);
+      }
+    }
+    return;
+  }
+
+  // Case 2: 2, 3, or 4 Real Players Found!
+  // Start 100% Real Online Multiplayer Game with strictly real players - ZERO BOTS ADDED!
+  const realCount = batch.length;
+  const roomCode = generateRoomCode();
+
+  // Color assignments:
+  // 2 players -> RED, YELLOW (opposite corners for classic 2-player board)
+  // 3 players -> RED, GREEN, YELLOW
+  // 4 players -> RED, GREEN, YELLOW, BLUE
+  let assignedColors: PlayerColor[] = COLOR_ORDER_2_PLAYERS;
+  if (realCount === 3) {
+    assignedColors = COLOR_ORDER_3_PLAYERS;
+  } else if (realCount >= 4) {
+    assignedColors = COLOR_ORDER_4_PLAYERS;
+  }
+
+  const roomPlayers: RoomPlayer[] = batch.map((qp, idx) => ({
+    id: qp.playerId,
+    name: qp.playerName || `Player ${idx + 1}`,
+    surname: qp.playerSurname || "",
+    color: assignedColors[idx],
+    isCreator: idx === 0,
+    isBot: false,
+    ws: qp.ws,
+  }));
+
+  const newRoom: RoomData = {
+    code: roomCode,
+    hostId: roomPlayers[0].id,
+    players: roomPlayers,
+    isTeamUpMode: false,
+    isHomeEntryLockEnabled: true,
+    isTokenBlockEnabled: true,
+    gameStarted: true,
+    createdAt: Date.now(),
+    currentSeq: 0,
+    actionRingBuffer: [],
+    processedClientActionIds: new Set(),
+    activePlayerIndex: 0,
+    playerMissedTurns: new Map(),
+  };
+  newRoom.gameState = createInitialGameState(newRoom);
+
+  rooms.set(roomCode, newRoom);
+
+  // Bind every matched player's socket session to this room so disconnect/leave works cleanly
+  for (const qp of batch) {
+    setWsSession(qp.ws, roomCode, qp.playerId);
+  }
+
+  const sanitized = getSanitizedRoom(newRoom);
+  broadcastToRoom(newRoom, {
+    type: "GAME_STARTED",
+    room: sanitized,
+    isAutoMatch: true,
+    realCount,
+  });
+
+  // Start turn timer for first active player
+  startRoomTurnTimer(newRoom);
+}
+
+function startMatchmakingTimer() {
+  if (matchmakingTimerInterval) return;
+  matchmakingCountdown = MATCHMAKING_TIMEOUT;
+  broadcastQueueUpdate();
+
+  matchmakingTimerInterval = setInterval(() => {
+    matchmakingCountdown -= 1;
+    broadcastQueueUpdate();
+
+    if (matchmakingCountdown <= 0) {
+      if (matchmakingTimerInterval) {
+        clearInterval(matchmakingTimerInterval);
+        matchmakingTimerInterval = null;
+      }
+
+      // 60 seconds finished -> Launch match with available real players (2/3 players = no bots; 1 player = 1v1 Play with Bot)
+      if (activeQueue.length > 0) {
+        const batch = activeQueue.splice(0, 4);
+        launchAutoMatch(batch);
+      }
+
+      // If more players are still in queue (e.g. 5th player), restart timer for next batch
+      if (activeQueue.length > 0) {
+        startMatchmakingTimer();
+      } else {
+        matchmakingCountdown = MATCHMAKING_TIMEOUT;
+      }
+    }
+  }, 1000);
+}
+
+function stopMatchmakingTimerIfEmpty() {
+  if (activeQueue.length === 0 && matchmakingTimerInterval) {
+    clearInterval(matchmakingTimerInterval);
+    matchmakingTimerInterval = null;
+    matchmakingCountdown = MATCHMAKING_TIMEOUT;
+  }
+}
+
+// Color assignment constants (consistent clockwise board seat order)
+const COLOR_ORDER_2_PLAYERS: PlayerColor[] = ["RED", "YELLOW"];
+const COLOR_ORDER_3_PLAYERS: PlayerColor[] = ["RED", "GREEN", "YELLOW"];
+const COLOR_ORDER_4_PLAYERS: PlayerColor[] = ["RED", "GREEN", "YELLOW", "BLUE"];
+
+function generateRoomCode(): string {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  if (rooms.has(code)) {
+    return generateRoomCode();
+  }
+  return code;
 }
 
 function getSanitizedRoom(room: RoomData): SignalingRoom {
@@ -177,756 +613,21 @@ function getSanitizedRoom(room: RoomData): SignalingRoom {
     isTokenBlockEnabled: room.isTokenBlockEnabled,
     gameStarted: room.gameStarted,
     gameState: room.gameState,
+    currentSeq: room.currentSeq,
     createdAt: room.createdAt,
   };
 }
 
-function createInitialGameState(room: RoomData): any {
-  return {
-    mode: "ONLINE",
-    gameStarted: true,
-    activePlayerIndex: 0,
-    diceQueue: [],
-    diceRollCountThisTurn: 0,
-    consecutiveSixesCount: 0,
-    extraRollsCount: 0,
-    hasBustedThisTurn: false,
-    selectedDiceValue: null,
-    winnerColor: null,
-    rankings: [],
-    isTeamUpMode: room.isTeamUpMode,
-    isHomeEntryLockEnabled: room.isHomeEntryLockEnabled,
-    isTokenBlockEnabled: room.isTokenBlockEnabled,
-    players: room.players.map((p) => ({
-      color: p.color,
-      name: p.name,
-      surname: p.surname || "",
-      isBot: Boolean(p.isBot),
-      hasKilledOpponent: false,
-      isActive: p.color === room.players[0].color,
-      rollHistory: [],
-      lastRolledValue: undefined,
-      tokens: [0, 1, 2, 3].map((id) => ({
-        id,
-        color: p.color,
-        state: "BASE",
-        position: -1,
-      })),
-      isOffline: Boolean(p.isOffline),
-      hasQuit: Boolean(p.hasQuit),
-      turnsWithoutSix: 0,
-    })),
-    logs: [`🎮 Online Match Started! ${room.players[0].name} (Red) goes first!`],
-  };
-}
-
-function isTokenPartofJodaOnStandardCell(t: any, player: any): boolean {
-  if (t.state !== "TRACK") return false;
-  const globalIdx = (START_INDEX[t.color as PlayerColor] + t.position) % 52;
-  if (SAFE_INDICES.includes(globalIdx)) return false;
-  const count = (player.tokens || []).filter(
-    (tk: any) => tk.state === "TRACK" && ((START_INDEX[tk.color as PlayerColor] + tk.position) % 52) === globalIdx
-  ).length;
-  return count === 2 || count === 4;
-}
-
-function isPathBlocked(t: any, player: any, val: number, state: any): boolean {
-  if (state.isTokenBlockEnabled === false) return false;
-  if (t.state === "BASE" || t.state === "HOME") return false;
-  const isMovingAsJoda = isTokenPartofJodaOnStandardCell(t, player) && (val % 2 === 0);
-  const stepsToCheck = isMovingAsJoda ? Math.floor(val / 2) : val;
-
-  let stepState = t.state;
-  let stepPos = t.position;
-
-  for (let s = 1; s <= stepsToCheck; s++) {
-    if (stepState === "TRACK") {
-      if (stepPos === 50) {
-        if (state.isHomeEntryLockEnabled === false || player.hasKilledOpponent) {
-          stepState = "HOME_STRETCH";
-          stepPos = 0;
-        } else {
-          stepState = "TRACK";
-          stepPos = 51;
-        }
-      } else if (stepPos === 51) {
-        stepState = "TRACK";
-        stepPos = 0;
-      } else {
-        stepState = "TRACK";
-        stepPos = stepPos + 1;
-      }
-    } else if (stepState === "HOME_STRETCH") {
-      if (stepPos === 4) {
-        stepState = "HOME";
-        stepPos = -1;
-      } else {
-        stepState = "HOME_STRETCH";
-        stepPos = stepPos + 1;
-      }
-    } else if (stepState === "HOME") {
-      return true;
-    }
-
-    if (stepState === "TRACK") {
-      const globalIdx = (START_INDEX[t.color as PlayerColor] + stepPos) % 52;
-      if (!SAFE_INDICES.includes(globalIdx)) {
-        let blockOwnerColor: PlayerColor | null = null;
-        for (const p of state.players || []) {
-          const count = (p.tokens || []).filter(
-            (tk: any) => tk.state === "TRACK" && ((START_INDEX[tk.color as PlayerColor] + tk.position) % 52) === globalIdx
-          ).length;
-          if (count >= 2) {
-            blockOwnerColor = p.color;
-            break;
-          }
-        }
-        if (blockOwnerColor !== null) {
-          if (s < stepsToCheck) return true;
-          if (blockOwnerColor !== t.color && !isMovingAsJoda) return true;
-        }
+function broadcastToRoom(room: RoomData, message: object) {
+  const payload = JSON.stringify(message);
+  for (const player of room.players) {
+    if (player.ws && player.ws.readyState === WebSocket.OPEN) {
+      try {
+        player.ws.send(payload);
+      } catch (err) {
+        console.error(`[WS] Error broadcasting to player ${player.id}:`, err);
       }
     }
-  }
-  return false;
-}
-
-function canTokenMove(t: any, player: any, val: number, state: any): boolean {
-  if (t.state === "HOME") return false;
-  if (t.state === "BASE") {
-    return val === 6;
-  }
-  if (isPathBlocked(t, player, val, state)) return false;
-
-  const isMovingAsJoda = isTokenPartofJodaOnStandardCell(t, player) && (val % 2 === 0);
-  const steps = isMovingAsJoda ? Math.floor(val / 2) : val;
-
-  if (t.state === "TRACK") {
-    if (t.position + steps <= 50) return true;
-    if (t.position + steps === 51) {
-      return state.isHomeEntryLockEnabled !== false && !player.hasKilledOpponent;
-    }
-    if (state.isHomeEntryLockEnabled !== false && !player.hasKilledOpponent) {
-      return true;
-    }
-    const overflow = (t.position + steps) - 51;
-    return overflow <= 5;
-  }
-  if (t.state === "HOME_STRETCH") {
-    return t.position + steps <= 5;
-  }
-  return false;
-}
-
-function getPlayableTokensOnServer(state: any, diceVal?: number): { color: PlayerColor; id: number; diceValue: number }[] {
-  const activePlayer = state.players?.[state.activePlayerIndex];
-  if (!activePlayer || state.winnerColor) return [];
-  const diceValuesToCheck = diceVal !== undefined ? [diceVal] : (state.diceQueue || []);
-  const playable: { color: PlayerColor; id: number; diceValue: number }[] = [];
-
-  for (const val of diceValuesToCheck) {
-    for (const t of activePlayer.tokens || []) {
-      if (canTokenMove(t, activePlayer, val, state)) {
-        playable.push({ color: activePlayer.color, id: t.id, diceValue: val });
-      }
-    }
-    if (state.isTeamUpMode && playable.length === 0) {
-      const teammate = state.players.find((p: any) => areTeammates(p.color, activePlayer.color));
-      if (teammate) {
-        for (const t of teammate.tokens || []) {
-          if (canTokenMove(t, teammate, val, state)) {
-            playable.push({ color: teammate.color, id: t.id, diceValue: val });
-          }
-        }
-      }
-    }
-  }
-  return playable;
-}
-
-function handleServerRollDice(io: Server, room: RoomData, socket: Socket, data: any) {
-  if (!room.gameStarted || room.winnerColor) return;
-  const activePlayer = room.players[room.activePlayerIndex];
-  if (!activePlayer) return;
-
-  if (data.playerId && data.playerId !== activePlayer.id && !activePlayer.isBot) {
-    socket.emit("message", { type: "ERROR", message: "Not your turn!" });
-    return;
-  }
-
-  clearRoomTurnTimer(room);
-
-  if (!room.gameState) {
-    room.gameState = createInitialGameState(room);
-  }
-
-  const gs = room.gameState;
-  const currentConsecutiveSixes = gs.consecutiveSixesCount || 0;
-  const queue = Array.isArray(gs.diceQueue) ? gs.diceQueue : [];
-
-  // Cryptographically random roll between 1 and 6
-  let rollValue = Math.floor(Math.random() * 6) + 1;
-
-  // Respect dry spell pity rule if provided
-  const turnsWithoutSix = data.turnsWithoutSix || 0;
-  if (turnsWithoutSix >= 5 && Math.random() < 0.6) {
-    rollValue = 6;
-  }
-
-  let isBust = false;
-  let nextConsecutiveSixes = currentConsecutiveSixes;
-
-  if (rollValue === 6) {
-    nextConsecutiveSixes += 1;
-    if (nextConsecutiveSixes >= 3) {
-      isBust = true;
-    }
-  } else {
-    nextConsecutiveSixes = 0;
-  }
-
-  gs.consecutiveSixesCount = nextConsecutiveSixes;
-
-  if (gs.players && gs.players[room.activePlayerIndex]) {
-    const p = gs.players[room.activePlayerIndex];
-    p.rollHistory = [...(p.rollHistory || []), rollValue];
-    p.lastRolledValue = rollValue;
-    p.turnsWithoutSix = rollValue === 6 ? 0 : (p.turnsWithoutSix || 0) + 1;
-  }
-
-  if (isBust) {
-    gs.diceQueue = [];
-    gs.selectedDiceValue = null;
-    gs.consecutiveSixesCount = 0;
-    const logMsg = `💥 BUST! ${activePlayer.name} rolled 3 consecutive 6s! Turn passed.`;
-    gs.logs = [logMsg, ...(gs.logs || [])];
-
-    let nextIndex = (room.activePlayerIndex + 1) % room.players.length;
-    let attempts = 0;
-    while (attempts < room.players.length) {
-      const candidate = room.players[nextIndex];
-      if (candidate && !candidate.hasQuit) break;
-      nextIndex = (nextIndex + 1) % room.players.length;
-      attempts++;
-    }
-    room.activePlayerIndex = nextIndex;
-    gs.activePlayerIndex = nextIndex;
-    room.currentSeq = (room.currentSeq || 0) + 1;
-
-    const bustPayload = {
-      type: "DICE_ROLLED",
-      seq: room.currentSeq,
-      roomCode: room.code,
-      playerId: activePlayer.id,
-      color: activePlayer.color,
-      rollValue: 6,
-      diceQueue: [],
-      selectedDiceValue: null,
-      isBust: true,
-      canRollFurther: false,
-      nextActiveIndex: nextIndex,
-      gameState: gs,
-      timestamp: Date.now(),
-    };
-    room.lastAction = bustPayload;
-    room.lastActionTime = Date.now();
-    broadcastToRoom(io, room, bustPayload);
-
-    setTimeout(() => {
-      startRoomTurnTimer(io, room);
-    }, 1200);
-    return;
-  }
-
-  const nextQueue = [...queue, rollValue];
-  gs.diceQueue = nextQueue;
-  const canRollFurther = (rollValue === 6 && nextQueue.length < 3);
-  gs.selectedDiceValue = canRollFurther ? null : (nextQueue[0] || null);
-
-  const playable = getPlayableTokensOnServer(gs, rollValue);
-  const hasValidMove = playable.length > 0;
-
-  room.currentSeq = (room.currentSeq || 0) + 1;
-  const rollPayload = {
-    type: "DICE_ROLLED",
-    seq: room.currentSeq,
-    roomCode: room.code,
-    playerId: activePlayer.id,
-    color: activePlayer.color,
-    rollValue,
-    diceQueue: nextQueue,
-    selectedDiceValue: gs.selectedDiceValue,
-    canRollFurther,
-    consecutiveSixesCount: nextConsecutiveSixes,
-    hasValidMove,
-    gameState: gs,
-    timestamp: Date.now(),
-  };
-
-  room.lastAction = rollPayload;
-  room.lastActionTime = Date.now();
-  broadcastToRoom(io, room, rollPayload);
-
-  if (canRollFurther) {
-    // Multi-roll: Reset timer so player can roll again
-    startRoomTurnTimer(io, room);
-  } else if (!hasValidMove) {
-    // Zero valid moves (e.g. rolled a non-6 with all gotis in BASE):
-    // Wait 1200ms so player sees the roll, then auto-advance
-    setTimeout(() => {
-      if (room.gameState === gs && room.activePlayerIndex === gs.activePlayerIndex && gs.diceQueue.length > 0) {
-        gs.diceQueue = [];
-        gs.selectedDiceValue = null;
-        advanceRoomTurnOnTimeout(io, room, activePlayer, false);
-      }
-    }, 1200);
-  } else {
-    // Player has gotis to move: Full 20s (+1s grace) timer
-    startRoomTurnTimer(io, room);
-  }
-}
-
-function handleServerMoveToken(io: Server, room: RoomData, socket: Socket, data: any) {
-  if (!room.gameStarted || room.winnerColor) return;
-  const activePlayer = room.players[room.activePlayerIndex];
-  if (!activePlayer) return;
-
-  clearRoomTurnTimer(room);
-
-  if (!room.gameState) {
-    room.gameState = createInitialGameState(room);
-  }
-  const gs = room.gameState;
-  const { tokenId, color, diceValue } = data;
-
-  const movingPlayer = (gs.players || []).find((p: any) => p.color === color) || gs.players[gs.activePlayerIndex];
-  if (!movingPlayer) return;
-  const token = (movingPlayer.tokens || []).find((t: any) => t.id === tokenId);
-  if (!token) return;
-
-  let val = diceValue !== undefined ? diceValue : (gs.selectedDiceValue || (gs.diceQueue && gs.diceQueue[0]));
-  if (!val) return;
-
-  const isMovingAsJoda = isTokenPartofJodaOnStandardCell(token, movingPlayer) && (val % 2 === 0);
-  const steps = isMovingAsJoda ? Math.floor(val / 2) : val;
-
-  let newPosition = token.position;
-  let newState = token.state;
-
-  if (token.state === "BASE") {
-    if (val === 6) {
-      newState = "TRACK";
-      newPosition = 0;
-    } else {
-      return;
-    }
-  } else if (token.state === "TRACK") {
-    const targetPos = token.position + steps;
-    if (targetPos <= 50) {
-      newPosition = targetPos;
-    } else if (targetPos === 51) {
-      if (gs.isHomeEntryLockEnabled !== false && !movingPlayer.hasKilledOpponent) {
-        newPosition = 51;
-      } else {
-        newState = "HOME_STRETCH";
-        newPosition = 0;
-      }
-    } else {
-      if (gs.isHomeEntryLockEnabled !== false && !movingPlayer.hasKilledOpponent) {
-        newPosition = (targetPos) % 52;
-      } else {
-        const stretchPos = targetPos - 51;
-        if (stretchPos === 5) {
-          newState = "HOME";
-          newPosition = -1;
-        } else if (stretchPos < 5) {
-          newState = "HOME_STRETCH";
-          newPosition = stretchPos;
-        } else {
-          return;
-        }
-      }
-    }
-  } else if (token.state === "HOME_STRETCH") {
-    const targetPos = token.position + steps;
-    if (targetPos === 5) {
-      newState = "HOME";
-      newPosition = -1;
-    } else if (targetPos < 5) {
-      newPosition = targetPos;
-    } else {
-      return;
-    }
-  }
-
-  token.state = newState;
-  token.position = newPosition;
-
-  let hasKill = false;
-  const killedList: any[] = [];
-  if (newState === "TRACK") {
-    const globalIdx = (START_INDEX[token.color as PlayerColor] + newPosition) % 52;
-    if (!SAFE_INDICES.includes(globalIdx)) {
-      for (const p of gs.players || []) {
-        if (p.color === movingPlayer.color) continue;
-        if (gs.isTeamUpMode && areTeammates(p.color, movingPlayer.color)) continue;
-        const oppTokensOnCell = (p.tokens || []).filter(
-          (t: any) => t.state === "TRACK" && ((START_INDEX[p.color as PlayerColor] + t.position) % 52) === globalIdx
-        );
-        if (oppTokensOnCell.length > 0) {
-          oppTokensOnCell.forEach((kt: any) => {
-            kt.state = "BASE";
-            kt.position = -1;
-            killedList.push({ color: p.color, id: kt.id });
-          });
-          hasKill = true;
-          movingPlayer.hasKilledOpponent = true;
-        }
-      }
-    }
-  }
-
-  if (Array.isArray(gs.diceQueue)) {
-    const qIdx = gs.diceQueue.indexOf(val);
-    if (qIdx !== -1) {
-      gs.diceQueue.splice(qIdx, 1);
-    }
-    gs.selectedDiceValue = gs.diceQueue.length > 1 ? null : (gs.diceQueue[0] || null);
-  }
-
-  const isWinner = (movingPlayer.tokens || []).every((t: any) => t.state === "HOME");
-  if (isWinner) {
-    gs.winnerColor = movingPlayer.color;
-    room.winnerColor = movingPlayer.color;
-    gs.rankings = [movingPlayer.color];
-  }
-
-  const reachedHome = newState === "HOME";
-  const getsBonusRoll = hasKill || reachedHome;
-
-  let nextActiveIndex = room.activePlayerIndex;
-  if (!isWinner) {
-    if (getsBonusRoll) {
-      gs.diceQueue = [];
-      gs.selectedDiceValue = null;
-      startRoomTurnTimer(io, room);
-    } else if (!gs.diceQueue || gs.diceQueue.length === 0) {
-      nextActiveIndex = (room.activePlayerIndex + 1) % room.players.length;
-      let attempts = 0;
-      while (attempts < room.players.length) {
-        const candidate = room.players[nextActiveIndex];
-        if (candidate && !candidate.hasQuit) break;
-        nextActiveIndex = (nextActiveIndex + 1) % room.players.length;
-        attempts++;
-      }
-      room.activePlayerIndex = nextActiveIndex;
-      gs.activePlayerIndex = nextActiveIndex;
-      startRoomTurnTimer(io, room);
-    } else {
-      startRoomTurnTimer(io, room);
-    }
-  }
-
-  room.currentSeq = (room.currentSeq || 0) + 1;
-  const movePayload = {
-    type: "TOKEN_MOVED",
-    seq: room.currentSeq,
-    roomCode: room.code,
-    playerId: activePlayer.id,
-    color,
-    tokenId,
-    usedDiceValue: val,
-    destination: { state: newState, position: newPosition },
-    capturedTokens: killedList,
-    isBonus: getsBonusRoll,
-    nextActiveIndex,
-    winnerColor: gs.winnerColor,
-    rankings: gs.rankings,
-    gameState: gs,
-    timestamp: Date.now(),
-  };
-
-  room.lastAction = movePayload;
-  room.lastActionTime = Date.now();
-  broadcastToRoom(io, room, movePayload);
-}
-
-function handlePlayerDisconnectOrForfeit(io: Server, room: RoomData, playerId: string, isPermanentLeave: boolean = false) {
-  const p = room.players.find((player) => player.id === playerId);
-  if (!p) return;
-  p.isOffline = true;
-  if (isPermanentLeave) {
-    p.hasQuit = true;
-  }
-  const sanitized = getSanitizedRoom(room);
-  broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: sanitized });
-  broadcastToRoom(io, room, { type: "PLAYER_OFFLINE", playerId: p.id, color: p.color, name: p.name, room: sanitized });
-
-  if (!room.gameStarted || room.winnerColor) return;
-
-  if (isPermanentLeave) {
-    const activePlayers = room.players.filter((pl) => !pl.hasQuit);
-    if (activePlayers.length === 1) {
-      const winnerPlayer = activePlayers[0];
-      room.winnerColor = winnerPlayer.color;
-      clearRoomTurnTimer(room);
-      const winLog = `👑 ${winnerPlayer.name} is declared the WINNER! Opponent left the match.`;
-      const existingLogs = Array.isArray(room.gameState?.logs) ? room.gameState.logs : [];
-      room.gameState = {
-        ...(room.gameState || {}),
-        gameStarted: true,
-        winnerColor: winnerPlayer.color,
-        rankings: [winnerPlayer.color],
-        logs: [winLog, ...existingLogs],
-      };
-      room.currentSeq = (room.currentSeq || 0) + 1;
-
-      broadcastToRoom(io, room, {
-        type: "WINNER_DECLARED",
-        roomCode: room.code,
-        winnerColor: winnerPlayer.color,
-        winnerName: winnerPlayer.name,
-        reason: "OPPONENT_OFFLINE",
-        gameState: room.gameState,
-        room: getSanitizedRoom(room),
-      });
-
-      setTimeout(() => {
-        if (rooms.has(room.code)) {
-          clearRoomTurnTimer(room);
-          rooms.delete(room.code);
-        }
-      }, 5000);
-      return;
-    }
-  }
-
-  const currentActivePlayer = room.players[room.activePlayerIndex];
-  if (currentActivePlayer && currentActivePlayer.id === playerId) {
-    clearRoomTurnTimer(room);
-    advanceRoomTurnOnTimeout(io, room, currentActivePlayer, true);
-  }
-}
-
-function advanceRoomTurnOnTimeout(io: Server, room: RoomData, activePlayer: RoomPlayer, isAlreadyOffline: boolean) {
-  clearRoomTurnTimer(room);
-  if (!room.gameStarted || room.winnerColor) return;
-  if (!isAlreadyOffline) {
-    const currentMisses = (room.playerMissedTurns.get(activePlayer.id) || 0) + 1;
-    room.playerMissedTurns.set(activePlayer.id, currentMisses);
-    if (currentMisses >= 3) {
-      handlePlayerDisconnectOrForfeit(io, room, activePlayer.id, true);
-      if (room.winnerColor) return;
-    }
-  }
-  let nextIndex = (room.activePlayerIndex + 1) % room.players.length;
-  let attempts = 0;
-  while (attempts < room.players.length) {
-    const candidate = room.players[nextIndex];
-    if (candidate && !candidate.hasQuit) break;
-    nextIndex = (nextIndex + 1) % room.players.length;
-    attempts++;
-  }
-  room.activePlayerIndex = nextIndex;
-  if (room.gameState) {
-    room.gameState.activePlayerIndex = nextIndex;
-    room.gameState.diceQueue = [];
-    room.gameState.selectedDiceValue = null;
-  }
-  room.currentSeq = (room.currentSeq || 0) + 1;
-  const skipPacket = {
-    seq: room.currentSeq,
-    type: "TURN_TIMEOUT_SKIP",
-    roomCode: room.code,
-    playerId: activePlayer.id,
-    color: activePlayer.color,
-    nextActiveIndex: nextIndex,
-    isOffline: activePlayer.isOffline,
-    gameState: room.gameState,
-    timestamp: Date.now(),
-  };
-  broadcastToRoom(io, room, skipPacket);
-  startRoomTurnTimer(io, room);
-}
-
-const OPPONENT_NAMES = [
-  "Oliver", "Emma", "Liam", "Olivia", "Noah",
-  "Ava", "Ethan", "Sophia", "Mason", "Isabella",
-  "William", "Mia", "James", "Charlotte", "Benjamin",
-  "Amelia", "Lucas", "Harper", "Alexander", "Evelyn",
-  "Daniel", "Emily", "Henry", "Abigail", "Michael",
-  "Ella", "Jackson", "Scarlett", "Sebastian", "Grace",
-  "Jack", "Chloe", "Aiden", "Victoria", "Matthew",
-  "Lily", "Samuel", "Zoe", "David", "Luna"
-];
-
-function getRandomOpponentNames(count: number, excludeNames: string[] = []): string[] {
-  const available = OPPONENT_NAMES.filter((n) => !excludeNames.includes(n));
-  for (let i = available.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    const temp = available[i];
-    available[i] = available[j];
-    available[j] = temp;
-  }
-  return available.slice(0, count);
-}
-
-interface QueuePlayer {
-  socketId: string;
-  socket: Socket;
-  playerId: string;
-  playerName: string;
-  playerSurname?: string;
-  joinedAt: number;
-}
-
-let activeQueue: QueuePlayer[] = [];
-let matchmakingTimerInterval: NodeJS.Timeout | null = null;
-let matchmakingCountdown = 60;
-const MATCHMAKING_TIMEOUT = 60;
-let matchmakingTargetTime = 0;
-
-function broadcastQueueUpdate(io: Server) {
-  const timeLeft = matchmakingTargetTime > 0 ? Math.max(0, Math.round((matchmakingTargetTime - Date.now()) / 1000)) : matchmakingCountdown;
-  const payload = {
-    type: "QUEUE_UPDATE",
-    count: activeQueue.length,
-    timeLeft,
-    totalTime: MATCHMAKING_TIMEOUT,
-    players: activeQueue.map((qp) => ({
-      id: qp.playerId,
-      name: qp.playerName,
-      surname: qp.playerSurname || "",
-    })),
-  };
-  io.emit("message", payload);
-}
-
-function generateRoomCode(): string {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let code = "";
-  for (let i = 0; i < 6; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  if (rooms.has(code)) return generateRoomCode();
-  return code;
-}
-
-function launchAutoMatch(io: Server, batch: QueuePlayer[]) {
-  if (batch.length === 0) return;
-  if (batch.length === 1) {
-    const singlePlayer = batch[0];
-    const assignedOpponentNames = getRandomOpponentNames(1, [singlePlayer.playerName]);
-    const opponentName = assignedOpponentNames[0] || "Oliver";
-    singlePlayer.socket.emit("message", {
-      type: "START_LOCAL_VIRTUAL_MATCH",
-      yourColor: "RED",
-      opponent: { name: opponentName, color: "YELLOW" },
-    });
-    return;
-  }
-
-  const realCount = batch.length;
-  const roomCode = generateRoomCode();
-  let assignedColors: PlayerColor[] = COLOR_ORDER_2_PLAYERS;
-  if (realCount === 3) assignedColors = COLOR_ORDER_3_PLAYERS;
-  else if (realCount >= 4) assignedColors = COLOR_ORDER_4_PLAYERS;
-
-  const roomPlayers: RoomPlayer[] = batch.map((qp, idx) => ({
-    id: qp.playerId,
-    name: qp.playerName || `Player ${idx + 1}`,
-    surname: qp.playerSurname || "",
-    color: assignedColors[idx],
-    isCreator: idx === 0,
-    isBot: false,
-    socketId: qp.socketId,
-  }));
-
-  const newRoom: RoomData = {
-    code: roomCode,
-    hostId: roomPlayers[0].id,
-    players: roomPlayers,
-    isTeamUpMode: false,
-    isHomeEntryLockEnabled: true,
-    isTokenBlockEnabled: true,
-    gameStarted: true,
-    createdAt: Date.now(),
-    currentSeq: 0,
-    activePlayerIndex: 0,
-    playerMissedTurns: new Map(),
-    disconnectTimers: new Map(),
-  };
-
-  newRoom.gameState = createInitialGameState(newRoom);
-  rooms.set(roomCode, newRoom);
-  const sanitized = getSanitizedRoom(newRoom);
-
-  batch.forEach((qp, idx) => {
-    qp.socket.join(roomCode);
-    qp.socket.data = qp.socket.data || {};
-    qp.socket.data.roomCode = roomCode;
-    qp.socket.data.playerId = qp.playerId;
-    qp.socket.emit("message", {
-      type: "GAME_STARTED",
-      room: sanitized,
-      yourColor: assignedColors[idx],
-      isAutoMatch: true,
-      realCount,
-      gameState: newRoom.gameState,
-    });
-  });
-
-  broadcastToRoom(io, newRoom, {
-    type: "GAME_STARTED",
-    room: sanitized,
-    isAutoMatch: true,
-    realCount,
-    gameState: newRoom.gameState,
-  });
-  startRoomTurnTimer(io, newRoom);
-}
-
-function startMatchmakingTimer(io: Server) {
-  if (matchmakingTimerInterval) {
-    if (activeQueue.length >= 2 && matchmakingCountdown > 5) {
-      matchmakingCountdown = 5;
-      matchmakingTargetTime = Date.now() + 5000;
-      broadcastQueueUpdate(io);
-    }
-    return;
-  }
-  matchmakingCountdown = activeQueue.length >= 2 ? 5 : MATCHMAKING_TIMEOUT;
-  matchmakingTargetTime = Date.now() + matchmakingCountdown * 1000;
-  broadcastQueueUpdate(io);
-  matchmakingTimerInterval = setInterval(() => {
-    matchmakingCountdown -= 1;
-    if (matchmakingCountdown <= 0) {
-      if (matchmakingTimerInterval) {
-        clearInterval(matchmakingTimerInterval);
-        matchmakingTimerInterval = null;
-      }
-      if (activeQueue.length > 0) {
-        const batch = activeQueue.splice(0, 4);
-        launchAutoMatch(io, batch);
-      }
-      if (activeQueue.length > 0) {
-        startMatchmakingTimer(io);
-      } else {
-        matchmakingCountdown = MATCHMAKING_TIMEOUT;
-        matchmakingTargetTime = 0;
-      }
-    } else {
-      broadcastQueueUpdate(io);
-    }
-  }, 1000);
-}
-
-function stopMatchmakingTimerIfEmpty(io: Server) {
-  if (activeQueue.length === 0 && matchmakingTimerInterval) {
-    clearInterval(matchmakingTimerInterval);
-    matchmakingTimerInterval = null;
-    matchmakingCountdown = MATCHMAKING_TIMEOUT;
-    matchmakingTargetTime = 0;
   }
 }
 
@@ -934,41 +635,66 @@ async function startServer() {
   const app = express();
   const portArgIndex = process.argv.indexOf("--port");
   const cliPort = portArgIndex !== -1 ? parseInt(process.argv[portArgIndex + 1], 10) : null;
-  const PORT = cliPort || (process.env.NODE_ENV === "production" && process.env.PORT ? parseInt(process.env.PORT, 10) : 3000);
+  const PORT = cliPort || (process.env.PORT ? parseInt(process.env.PORT, 10) : 3000);
 
+  // CORS Middleware for Render & cross-origin frontend requests
   app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    if (req.method === "OPTIONS") return res.sendStatus(200);
+    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+    if (req.method === "OPTIONS") {
+      return res.sendStatus(200);
+    }
     next();
   });
+
   app.use(express.json());
 
+  // Server Info endpoint
   app.get("/api/info", (_req, res) => {
-    res.json({ service: "Ludo Server-Authoritative Socket.io Server", status: "running", activeRooms: rooms.size, uptime: process.uptime() });
+    res.json({
+      service: "Ludo Multiplayer Live Server",
+      status: "running",
+      activeRooms: rooms.size,
+      uptime: process.uptime(),
+      wsEndpoint: "/ws",
+    });
   });
+
+  // Health check endpoint (for Render health check probes)
   app.get("/api/health", (_req, res) => {
     res.json({ status: "ok", activeRooms: rooms.size });
   });
+
+  // App version check endpoint
   app.get("/api/app-version", (_req, res) => {
     res.json({
       latestVersion: "1.0.1",
       minSupportedVersion: "1.0.1",
       minRequiredVersion: "1.0.1",
       updateUrl: "https://strategizestudio-commits.github.io/ludo-strategize/",
-      releaseNotes: "Server-authoritative smooth online multiplayer",
+      playStoreUrl: "https://strategizestudio-commits.github.io/ludo-strategize/",
+      appStoreUrl: "https://strategizestudio-commits.github.io/ludo-strategize/",
+      releaseNotes: "Optimized online multiplayer and security enhancements",
     });
   });
+
+  // REST endpoint to get room info
   app.get("/api/rooms/:code", (req, res) => {
     const code = req.params.code.toUpperCase();
     const room = rooms.get(code);
-    if (!room) return res.status(404).json({ error: "Room not found" });
+    if (!room) {
+      return res.status(404).json({ error: "Room not found" });
+    }
     return res.json(getSanitizedRoom(room));
   });
+
+  // REST endpoint to check if a player has an active ongoing match
   app.get("/api/player-active-match/:playerId", (req, res) => {
     const { playerId } = req.params;
-    if (!playerId) return res.json({ hasActiveMatch: false });
+    if (!playerId) {
+      return res.json({ hasActiveMatch: false });
+    }
     for (const [code, room] of rooms.entries()) {
       if (room.gameStarted && !room.winnerColor) {
         const p = room.players.find((player) => player.id === playerId && !player.hasQuit);
@@ -985,61 +711,104 @@ async function startServer() {
     }
     return res.json({ hasActiveMatch: false });
   });
+
+  // REST endpoint to leave/forfeit an active match
   app.post("/api/player-leave-match", (req, res) => {
     const { playerId, roomCode } = req.body || {};
-    if (!playerId) return res.status(400).json({ error: "Missing playerId" });
+    if (!playerId) {
+      return res.status(400).json({ error: "Missing playerId" });
+    }
     for (const [code, room] of rooms.entries()) {
-      if (roomCode && code !== roomCode.toUpperCase()) continue;
+      if (roomCode && code !== String(roomCode).toUpperCase()) continue;
       const p = room.players.find((player) => player.id === playerId);
       if (p) {
-        handlePlayerDisconnectOrForfeit(io, room, playerId, true);
+        if (!room.gameStarted) {
+          room.players = room.players.filter((pl) => pl.id !== playerId);
+          if (room.players.length === 0) {
+            rooms.delete(code);
+          } else {
+            if (room.hostId === playerId) {
+              room.hostId = room.players[0].id;
+              room.players[0].isCreator = true;
+            }
+            broadcastToRoom(room, {
+              type: "ROOM_UPDATED",
+              room: getSanitizedRoom(room),
+            });
+          }
+        } else {
+          handlePlayerDisconnectOrForfeit(room, playerId, true);
+        }
       }
     }
     return res.json({ success: true });
   });
 
   const server = http.createServer(app);
-  const io = new Server(server, {
-    cors: { origin: "*" },
-    pingInterval: 8000,
-    pingTimeout: 10000,
+
+  // WebSocket Server setup
+  const wss = new WebSocketServer({ server, path: "/ws" });
+
+  // Keep-alive heartbeat (prevents Render 55-second idle WebSocket timeout)
+  const heartbeatInterval = setInterval(() => {
+    wss.clients.forEach((ws: WebSocket & { isAlive?: boolean }) => {
+      if (ws.isAlive === false) {
+        return ws.terminate();
+      }
+      ws.isAlive = false;
+      ws.ping();
+    });
+  }, 30000);
+
+  wss.on("close", () => {
+    clearInterval(heartbeatInterval);
   });
 
-  io.on("connection", (socket: Socket) => {
-    let currentRoomCode: string | null = null;
-    let currentPlayerId: string | null = null;
+  wss.on("connection", (ws: WebSocket & { isAlive?: boolean }) => {
+    ws.isAlive = true;
+    setWsSession(ws, null, null);
 
-    socket.on("message", (raw) => {
+    ws.on("pong", () => {
+      ws.isAlive = true;
+    });
+
+    ws.on("message", (raw) => {
       try {
-        const data = typeof raw === "string" ? JSON.parse(raw) : raw;
+        const data = JSON.parse(raw.toString());
         const { type } = data;
 
+        // PING / HEARTBEAT
         if (type === "PING") {
-          socket.emit("message", { type: "PONG", time: Date.now() });
+          ws.send(JSON.stringify({ type: "PONG", time: Date.now() }));
           return;
         }
 
+        // 1. JOIN_AUTO_QUEUE / join_auto_queue (Global 4-Player Matchmaking Queue)
         if (type === "JOIN_AUTO_QUEUE" || type === "join_auto_queue") {
           const { playerId, playerName, playerSurname } = data;
           if (!playerId) {
-            socket.emit("message", { type: "ERROR", message: "Invalid player ID" });
+            ws.send(JSON.stringify({ type: "ERROR", message: "Invalid player ID" }));
             return;
           }
-          activeQueue = activeQueue.filter((qp) => qp.playerId !== playerId && qp.socketId !== socket.id);
+
+          // Remove any existing entry for this player / socket first to prevent duplicates
+          activeQueue = activeQueue.filter((qp) => qp.playerId !== playerId && qp.ws !== ws);
+
           const queuePlayer: QueuePlayer = {
-            socketId: socket.id,
-            socket,
+            ws,
             playerId,
             playerName: playerName || `Player`,
             playerSurname: playerSurname || "",
             joinedAt: Date.now(),
           };
-          activeQueue.push(queuePlayer);
-          currentPlayerId = playerId;
 
+          activeQueue.push(queuePlayer);
+          setWsSession(ws, null, playerId);
+
+          // Condition A: If 4 real players join, immediately launch 4-player real match!
           if (activeQueue.length >= 4) {
             const batch = activeQueue.splice(0, 4);
-            launchAutoMatch(io, batch);
+            launchAutoMatch(batch);
             if (activeQueue.length === 0) {
               if (matchmakingTimerInterval) {
                 clearInterval(matchmakingTimerInterval);
@@ -1048,26 +817,38 @@ async function startServer() {
               }
             } else {
               matchmakingCountdown = MATCHMAKING_TIMEOUT;
-              broadcastQueueUpdate(io);
+              broadcastQueueUpdate();
             }
           } else {
-            startMatchmakingTimer(io);
-            broadcastQueueUpdate(io);
+            // Start 60-second countdown timer if not already running
+            startMatchmakingTimer();
+            broadcastQueueUpdate();
           }
           return;
         }
 
+        // 2. LEAVE_AUTO_QUEUE / leave_auto_queue
         if (type === "LEAVE_AUTO_QUEUE" || type === "leave_auto_queue") {
           const { playerId } = data;
-          activeQueue = activeQueue.filter((qp) => qp.socketId !== socket.id && (!playerId || qp.playerId !== playerId));
-          stopMatchmakingTimerIfEmpty(io);
-          broadcastQueueUpdate(io);
+          activeQueue = activeQueue.filter((qp) => qp.ws !== ws && (!playerId || qp.playerId !== playerId));
+          stopMatchmakingTimerIfEmpty();
+          broadcastQueueUpdate();
           return;
         }
 
+        // 3. CREATE_ROOM
         if (type === "CREATE_ROOM") {
-          const { playerId, playerName, playerSurname, isTeamUpMode = false, isHomeEntryLockEnabled = true, isTokenBlockEnabled = true } = data;
+          const {
+            playerId,
+            playerName,
+            playerSurname,
+            isTeamUpMode = false,
+            isHomeEntryLockEnabled = true,
+            isTokenBlockEnabled = true,
+          } = data;
+
           if (!playerId) return;
+
           const code = generateRoomCode();
           const hostPlayer: RoomPlayer = {
             id: playerId,
@@ -1075,8 +856,9 @@ async function startServer() {
             surname: playerSurname || "",
             color: "RED",
             isCreator: true,
-            socketId: socket.id,
+            ws,
           };
+
           const newRoom: RoomData = {
             code,
             hostId: playerId,
@@ -1087,79 +869,90 @@ async function startServer() {
             gameStarted: false,
             createdAt: Date.now(),
             currentSeq: 0,
+            actionRingBuffer: [],
+            processedClientActionIds: new Set(),
             activePlayerIndex: 0,
             playerMissedTurns: new Map(),
-            disconnectTimers: new Map(),
           };
-          rooms.set(code, newRoom);
-          socket.join(code);
-          currentRoomCode = code;
-          currentPlayerId = playerId;
 
-          socket.emit("message", {
-            type: "ROOM_CREATED",
-            room: getSanitizedRoom(newRoom),
-          });
+          rooms.set(code, newRoom);
+          setWsSession(ws, code, playerId);
+
+          const sanitized = getSanitizedRoom(newRoom);
+          ws.send(
+            JSON.stringify({
+              type: "ROOM_CREATED",
+              room: sanitized,
+              yourColor: "RED",
+            })
+          );
           return;
         }
 
+        // 2. JOIN_ROOM
         if (type === "JOIN_ROOM") {
           const { roomCode, playerId, playerName, playerSurname } = data;
           if (!roomCode || !playerId) {
-            socket.emit("message", { type: "ERROR", message: "Invalid parameters." });
+            ws.send(JSON.stringify({ type: "ERROR", message: "Invalid room code or player ID" }));
             return;
           }
+
           const code = roomCode.trim().toUpperCase();
           const room = rooms.get(code);
+
           if (!room) {
-            socket.emit("message", { type: "ERROR", message: "Room not found. Check the code." });
+            ws.send(JSON.stringify({ type: "ERROR", message: "Room not found. Check the 6-digit code." }));
             return;
           }
+
           if (room.gameStarted) {
-            const existingPlayer = room.players.find((p) => p.id === playerId);
-            if (existingPlayer) {
-              existingPlayer.socketId = socket.id;
-              existingPlayer.isOffline = false;
-              existingPlayer.hasQuit = false;
-              socket.join(code);
-              currentRoomCode = code;
-              currentPlayerId = playerId;
-              const sanitized = getSanitizedRoom(room);
-              socket.emit("message", { type: "REJOIN_SUCCESS", room: sanitized, yourColor: existingPlayer.color, gameState: room.gameState, lastAction: room.lastAction });
-              broadcastToRoom(io, room, { type: "PLAYER_RECONNECTED", playerId: existingPlayer.id, color: existingPlayer.color, name: existingPlayer.name, room: sanitized });
-              return;
-            }
-            socket.emit("message", { type: "ERROR", message: "Match is already in progress." });
+            ws.send(JSON.stringify({ type: "ERROR", message: "Game already started in this room." }));
+            return;
+          }
+
+          // Check if reconnecting
+          const existingPlayer = room.players.find((p) => p.id === playerId);
+          if (existingPlayer) {
+            existingPlayer.ws = ws;
+            existingPlayer.name = playerName || existingPlayer.name;
+            existingPlayer.surname = playerSurname || existingPlayer.surname;
+            setWsSession(ws, code, playerId);
+
+            const sanitized = getSanitizedRoom(room);
+            broadcastToRoom(room, {
+              type: "ROOM_UPDATED",
+              room: sanitized,
+            });
+            ws.send(
+              JSON.stringify({
+                type: "JOIN_SUCCESS",
+                room: sanitized,
+                yourColor: existingPlayer.color,
+              })
+            );
             return;
           }
 
           if (room.players.length >= 4) {
-            socket.emit("message", { type: "ERROR", message: "Room is already full." });
+            ws.send(JSON.stringify({ type: "ERROR", message: "Room is already full (Max 4 Players)." }));
             return;
           }
 
-          const existingPlayer = room.players.find((p) => p.id === playerId);
-          if (existingPlayer) {
-            existingPlayer.socketId = socket.id;
-            existingPlayer.name = playerName || existingPlayer.name;
-            existingPlayer.surname = playerSurname || existingPlayer.surname;
-            socket.join(code);
-            currentRoomCode = code;
-            currentPlayerId = playerId;
-            const sanitized = getSanitizedRoom(room);
-            broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: sanitized });
-            socket.emit("message", { type: "JOIN_SUCCESS", room: sanitized, yourColor: existingPlayer.color });
-            return;
-          }
-
+          // Color Assignment Logic based on Player Count:
+          // If 2 players: 1st=RED, 2nd=YELLOW (Opposite corners)
+          // If 3 players: 1st=RED, 2nd=GREEN, 3rd=YELLOW
+          // If 4 players: 1st=RED, 2nd=GREEN, 3rd=YELLOW, 4th=BLUE
           let availableColor: PlayerColor = "YELLOW";
-          if (room.players.length === 1) availableColor = "YELLOW";
-          else if (room.players.length === 2) {
+          if (room.players.length === 1) {
+            availableColor = "YELLOW";
+          } else if (room.players.length === 2) {
+            // Re-align player 2 to GREEN and assign YELLOW to player 3 for standard 3-player match
             room.players[0].color = "RED";
             room.players[1].color = "GREEN";
             availableColor = "YELLOW";
-          } else if (room.players.length === 3) availableColor = "BLUE";
-          else {
+          } else if (room.players.length === 3) {
+            availableColor = "BLUE";
+          } else {
             const takenColors = room.players.map((p) => p.color);
             availableColor = COLOR_ORDER_4_PLAYERS.find((c) => !takenColors.includes(c)) || "GREEN";
           }
@@ -1170,166 +963,226 @@ async function startServer() {
             surname: playerSurname || "",
             color: availableColor,
             isCreator: false,
-            socketId: socket.id,
+            ws,
           };
+
           room.players.push(newPlayer);
-          socket.join(code);
-          currentRoomCode = code;
-          currentPlayerId = playerId;
+          setWsSession(ws, code, playerId);
 
           const sanitized = getSanitizedRoom(room);
-          broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: sanitized });
-          socket.emit("message", { type: "JOIN_SUCCESS", room: sanitized, yourColor: availableColor });
+          broadcastToRoom(room, {
+            type: "ROOM_UPDATED",
+            room: sanitized,
+          });
+          ws.send(
+            JSON.stringify({
+              type: "JOIN_SUCCESS",
+              room: sanitized,
+              yourColor: availableColor,
+            })
+          );
           return;
         }
 
+        // 3. UPDATE_LOBBY_SETTINGS
         if (type === "UPDATE_LOBBY_SETTINGS") {
           const { roomCode, playerId, isTeamUpMode, isHomeEntryLockEnabled, isTokenBlockEnabled } = data;
           const room = rooms.get(roomCode?.toUpperCase());
           if (!room || room.hostId !== playerId) return;
+
           if (isTeamUpMode !== undefined) room.isTeamUpMode = Boolean(isTeamUpMode);
           if (isHomeEntryLockEnabled !== undefined) room.isHomeEntryLockEnabled = Boolean(isHomeEntryLockEnabled);
           if (isTokenBlockEnabled !== undefined) room.isTokenBlockEnabled = Boolean(isTokenBlockEnabled);
-          broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: getSanitizedRoom(room) });
+
+          const sanitized = getSanitizedRoom(room);
+          broadcastToRoom(room, {
+            type: "ROOM_UPDATED",
+            room: sanitized,
+          });
           return;
         }
 
+        // 4. ROTATE_PLAYERS
         if (type === "ROTATE_PLAYERS") {
           const { roomCode, playerId } = data;
           const room = rooms.get(roomCode?.toUpperCase());
           if (!room || room.hostId !== playerId || room.players.length < 2) return;
+
           const currentColors = room.players.map((p) => p.color);
           const rotatedColors = [currentColors[currentColors.length - 1], ...currentColors.slice(0, -1)];
-          room.players.forEach((p, idx) => { p.color = rotatedColors[idx]; });
-          broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: getSanitizedRoom(room) });
+          room.players.forEach((p, idx) => {
+            p.color = rotatedColors[idx];
+          });
+
+          const sanitized = getSanitizedRoom(room);
+          broadcastToRoom(room, {
+            type: "ROOM_UPDATED",
+            room: sanitized,
+          });
           return;
         }
 
+        // 5. START_GAME
         if (type === "START_GAME") {
           const { roomCode, playerId } = data;
           const room = rooms.get(roomCode?.toUpperCase());
-          if (!room) { socket.emit("message", { type: "ERROR", message: "Room not found" }); return; }
-          if (room.hostId !== playerId) { socket.emit("message", { type: "ERROR", message: "Only the host can start." }); return; }
-          if (room.players.length < 2) { socket.emit("message", { type: "ERROR", message: "At least 2 players required." }); return; }
-
-          if (room.players.length === 2) {
-            room.players[0].color = "RED"; room.players[1].color = "YELLOW";
-          } else if (room.players.length === 3) {
-            room.players[0].color = "RED"; room.players[1].color = "GREEN"; room.players[2].color = "YELLOW";
-          } else if (room.players.length >= 4) {
-            room.players[0].color = "RED"; room.players[1].color = "GREEN"; room.players[2].color = "YELLOW"; room.players[3].color = "BLUE";
+          if (!room) {
+            ws.send(JSON.stringify({ type: "ERROR", message: "Room not found" }));
+            return;
           }
+
+          if (room.hostId !== playerId) {
+            ws.send(JSON.stringify({ type: "ERROR", message: "Only the host can start the match." }));
+            return;
+          }
+
+          if (room.players.length < 2) {
+            ws.send(JSON.stringify({ type: "ERROR", message: "At least 2 players are required to start." }));
+            return;
+          }
+
+          // Preserve distinct valid colors configured in lobby (including ROTATE_PLAYERS);
+          // only repair if any color is missing or duplicated.
+          const expectedColors =
+            room.players.length === 2
+              ? COLOR_ORDER_2_PLAYERS
+              : room.players.length === 3
+                ? COLOR_ORDER_3_PLAYERS
+                : COLOR_ORDER_4_PLAYERS;
+          const currentColors = room.players.map((p) => p.color);
+          const hasUniqueValidColors =
+            new Set(currentColors).size === room.players.length &&
+            currentColors.every((c) => expectedColors.includes(c));
+          if (!hasUniqueValidColors) {
+            room.players.forEach((p, idx) => {
+              p.color = expectedColors[idx] || COLOR_ORDER_4_PLAYERS[idx];
+            });
+          }
+
           room.gameStarted = true;
           room.currentSeq = 0;
+          room.actionRingBuffer = [];
+          room.processedClientActionIds = new Set();
           room.activePlayerIndex = 0;
           room.playerMissedTurns = new Map();
           room.gameState = createInitialGameState(room);
 
-          broadcastToRoom(io, room, {
+          const sanitized = getSanitizedRoom(room);
+
+          broadcastToRoom(room, {
             type: "GAME_STARTED",
-            room: getSanitizedRoom(room),
-            gameState: room.gameState,
+            room: sanitized,
           });
-          startRoomTurnTimer(io, room);
+
+          // Start authoritative 23s turn timer for the initial active player
+          startRoomTurnTimer(room);
           return;
         }
 
+        // 6. CHECK_ACTIVE_MATCH
         if (type === "CHECK_ACTIVE_MATCH" || type === "check_active_match") {
           const { playerId } = data;
-          if (!playerId) { socket.emit("message", { type: "NO_ACTIVE_MATCH" }); return; }
+          if (!playerId) {
+            ws.send(JSON.stringify({ type: "NO_ACTIVE_MATCH" }));
+            return;
+          }
           let found = false;
           for (const [code, room] of rooms.entries()) {
             if (room.gameStarted && !room.winnerColor) {
               const p = room.players.find((player) => player.id === playerId && !player.hasQuit);
               if (p) {
                 found = true;
-                socket.emit("message", {
-                  type: "ACTIVE_MATCH_FOUND",
-                  roomCode: code,
-                  yourColor: p.color,
-                  room: getSanitizedRoom(room),
-                  gameState: room.gameState,
-                  lastAction: room.lastAction,
-                });
+                ws.send(
+                  JSON.stringify({
+                    type: "ACTIVE_MATCH_FOUND",
+                    roomCode: code,
+                    yourColor: p.color,
+                    room: getSanitizedRoom(room),
+                    gameState: room.gameState,
+                    currentSeq: room.currentSeq,
+                  })
+                );
                 break;
               }
             }
           }
-          if (!found) socket.emit("message", { type: "NO_ACTIVE_MATCH" });
+          if (!found) {
+            ws.send(JSON.stringify({ type: "NO_ACTIVE_MATCH" }));
+          }
           return;
         }
 
+        // 7. REJOIN_MATCH / rejoin_match
         if (type === "REJOIN_MATCH" || type === "rejoin_match") {
           const { roomCode, playerId, playerName } = data;
-          if (!roomCode || !playerId) return;
+          if (!roomCode || !playerId) {
+            ws.send(JSON.stringify({ type: "ERROR", message: "Missing room code or player ID" }));
+            return;
+          }
           const code = roomCode.trim().toUpperCase();
           const room = rooms.get(code);
-          if (!room || !room.gameStarted) return;
-          const player = room.players.find((p) => p.id === playerId);
-          if (!player) return;
-
-          if (room.disconnectTimers && room.disconnectTimers.has(playerId)) {
-            clearTimeout(room.disconnectTimers.get(playerId)!);
-            room.disconnectTimers.delete(playerId);
+          if (!room || !room.gameStarted || room.winnerColor) {
+            ws.send(JSON.stringify({ type: "ERROR", message: "Match is no longer active or room has closed." }));
+            return;
           }
-
-          player.socketId = socket.id;
+          const player = room.players.find((p) => p.id === playerId);
+          if (!player) {
+            ws.send(JSON.stringify({ type: "ERROR", message: "Player not found in this match." }));
+            return;
+          }
+          player.ws = ws;
           player.isOffline = false;
           player.hasQuit = false;
           if (playerName) player.name = playerName;
-          socket.join(code);
-          currentRoomCode = code;
-          currentPlayerId = playerId;
+          room.playerMissedTurns.set(playerId, 0);
+          setWsSession(ws, code, playerId);
 
           const sanitized = getSanitizedRoom(room);
-          socket.emit("message", {
-            type: "REJOIN_SUCCESS",
+          ws.send(
+            JSON.stringify({
+              type: "REJOIN_SUCCESS",
+              room: sanitized,
+              yourColor: player.color,
+              currentSeq: room.currentSeq,
+              gameState: room.gameState || createInitialGameState(room),
+            })
+          );
+
+          broadcastToRoom(room, {
+            type: "PLAYER_RECONNECTED",
+            playerId: player.id,
+            color: player.color,
+            name: player.name,
             room: sanitized,
-            yourColor: player.color,
-            gameState: room.gameState,
-            lastAction: room.lastAction,
           });
-          broadcastToRoom(io, room, { type: "PLAYER_RECONNECTED", playerId: player.id, color: player.color, name: player.name, room: sanitized });
           return;
         }
 
-        // --- SERVER-AUTHORITATIVE DICE ROLL & TOKEN MOVEMENT HANDLERS ---
-        if (type === "REQUEST_ROLL_DICE" || type === "ROLL_DICE") {
-          const targetCode = data.roomCode || currentRoomCode;
-          if (!targetCode) return;
-          const room = rooms.get(targetCode.toUpperCase());
-          if (!room) return;
-          handleServerRollDice(io, room, socket, data);
-          return;
-        }
-
-        if (type === "REQUEST_MOVE_TOKEN" || type === "MOVE_PAWN") {
-          const targetCode = data.roomCode || currentRoomCode;
-          if (!targetCode) return;
-          const room = rooms.get(targetCode.toUpperCase());
-          if (!room) return;
-          handleServerMoveToken(io, room, socket, data);
-          return;
-        }
-
+        // 8. FORFEIT_MATCH / forfeit_match / LEAVE_MATCH
         if (type === "FORFEIT_MATCH" || type === "forfeit_match" || type === "LEAVE_MATCH") {
-          const targetCode = data.roomCode || currentRoomCode;
-          const targetPlayerId = data.playerId || currentPlayerId;
+          const session = getWsSession(ws);
+          const targetCode = (data.roomCode || session.roomCode || "").toUpperCase();
+          const targetPlayerId = data.playerId || session.playerId;
           if (targetCode && targetPlayerId) {
-            const room = rooms.get(targetCode.toUpperCase());
+            const room = rooms.get(targetCode);
             if (room && room.gameStarted) {
-              handlePlayerDisconnectOrForfeit(io, room, targetPlayerId, true);
+              handlePlayerDisconnectOrForfeit(room, targetPlayerId, true);
             }
+          }
+          if (session.roomCode === targetCode) {
+            setWsSession(ws, null, session.playerId);
           }
           return;
         }
 
+        // 8.5 INDEPENDENT REAL-TIME GIFT CHANNEL
         if (type === "GIFT_EVENT" || type === "SEND_GIFT_EVENT" || type === "SEND_GIFT") {
           const { roomCode, giftId, senderColor, receiverColor, senderPlayerId, timestamp } = data;
           if (!roomCode) return;
           const room = rooms.get(roomCode.toUpperCase());
           if (!room) return;
-          broadcastToRoom(io, room, {
+
+          broadcastToRoom(room, {
             type: "GIFT_EVENT",
             roomCode,
             giftId,
@@ -1341,117 +1194,229 @@ async function startServer() {
           return;
         }
 
-        if (type === "FULL_BOARD_STATE" || type === "SYNC_GAME_STATE" || type === "GAME_ACTION") {
-          const { roomCode, playerId, gameState, seq } = data;
+        // 9. EVENT-BASED RELAY ARCHITECTURE (Server-Authoritative Sequence Numbering)
+        if (
+          type === "ROLL_DICE" ||
+          type === "MOVE_PAWN" ||
+          type === "TURN_TIMEOUT_SKIP" ||
+          type === "FULL_BOARD_STATE" ||
+          type === "SYNC_GAME_STATE" ||
+          type === "GAME_ACTION"
+        ) {
+          const { roomCode, playerId, gameState, clientActionId } = data;
           if (!roomCode) return;
           const room = rooms.get(roomCode.toUpperCase());
-          if (!room) return;
-          if (playerId) room.playerMissedTurns.set(playerId, 0);
+          if (!room || room.winnerColor) return;
 
-          if (typeof seq === "number" && seq > (room.currentSeq || 0)) {
-            room.currentSeq = seq;
-          } else if (!data.seq) {
-            data.seq = ++room.currentSeq;
+          // Deduplicate retries carrying the same clientActionId
+          if (typeof clientActionId === "string" && clientActionId.length > 0) {
+            if (!room.processedClientActionIds) {
+              room.processedClientActionIds = new Set();
+            }
+            if (room.processedClientActionIds.has(clientActionId)) {
+              return;
+            }
+            room.processedClientActionIds.add(clientActionId);
+            if (room.processedClientActionIds.size > 200) {
+              const firstKey = room.processedClientActionIds.values().next().value;
+              if (firstKey) room.processedClientActionIds.delete(firstKey);
+            }
+          }
+
+          // Reset missed turn strikes for active player on valid action
+          if (playerId) {
+            room.playerMissedTurns.set(playerId, 0);
+          }
+
+          // Strict server-authoritative monotonic sequence number (eliminates multi-client seq collision)
+          room.currentSeq = (room.currentSeq || 0) + 1;
+          data.seq = room.currentSeq;
+          if (type === "FULL_BOARD_STATE" || type === "SYNC_GAME_STATE") {
+            data.lastActionSequenceId = room.currentSeq;
           }
           data.timestamp = Date.now();
 
-          if (gameState) {
+          // Update authoritative room.gameState cache on full-state syncs (avoid stale pre-roll snapshots)
+          if (gameState && (type === "FULL_BOARD_STATE" || type === "SYNC_GAME_STATE" || type === "GAME_ACTION" || !room.gameState)) {
             room.gameState = gameState;
+            if (gameState.winnerColor) {
+              room.winnerColor = gameState.winnerColor;
+              clearRoomTurnTimer(room);
+              setTimeout(() => {
+                if (rooms.has(room.code)) {
+                  clearRoomTurnTimer(room);
+                  rooms.delete(room.code);
+                }
+              }, 5000);
+            } else if (typeof gameState.activePlayerIndex === "number") {
+              room.activePlayerIndex = gameState.activePlayerIndex;
+              startRoomTurnTimer(room);
+            }
+          } else if (type === "TURN_TIMEOUT_SKIP" && typeof data.nextActiveIndex === "number") {
+            room.activePlayerIndex = data.nextActiveIndex;
+            if (room.gameState) {
+              room.gameState.activePlayerIndex = data.nextActiveIndex;
+            }
+            startRoomTurnTimer(room);
+          } else if (type === "ROLL_DICE" || type === "MOVE_PAWN") {
+            // Keep server turn timer aligned with active player's per-phase 20s client timer
+            startRoomTurnTimer(room);
           }
-          broadcastToRoom(io, room, data);
+
+          // Push into 100-packet ring buffer
+          pushActionToRingBuffer(room, data);
+
+          // Relay action packet to all clients in the room
+          broadcastToRoom(room, data);
           return;
         }
 
+        // 10. FETCH_SEQ / RESEND_SEQ (Retransmission & full-sync recovery for missing packets)
         if (type === "FETCH_SEQ" || type === "fetch_seq") {
-          const { roomCode } = data;
-          if (!roomCode) return;
+          const { roomCode, missingSeqs } = data;
+          if (!roomCode || !Array.isArray(missingSeqs) || missingSeqs.length === 0) return;
           const room = rooms.get(roomCode.toUpperCase());
           if (!room) return;
-          socket.emit("message", {
-            type: "FULL_BOARD_STATE",
-            roomCode,
-            seq: room.currentSeq,
-            lastActionSequenceId: room.currentSeq,
-            gameState: room.gameState,
-            lastAction: room.lastAction,
-          });
+
+          const buffer = room.actionRingBuffer || [];
+          const foundPackets = buffer.filter((p) => missingSeqs.includes(p.seq));
+
+          // Check if client is asking for past seqs already evicted from ring buffer
+          const oldestBufferedSeq = buffer.length > 0 ? buffer[0].seq : room.currentSeq + 1;
+          const hasEvictedMissingSeq = missingSeqs.some(
+            (s: number) => typeof s === "number" && s <= room.currentSeq && s < oldestBufferedSeq && !foundPackets.some((fp) => fp.seq === s)
+          );
+
+          if (hasEvictedMissingSeq && room.gameState) {
+            ws.send(
+              JSON.stringify({
+                type: "SYNC_GAME_STATE",
+                roomCode: room.code,
+                seq: room.currentSeq,
+                lastActionSequenceId: room.currentSeq,
+                fullSync: true,
+                gameState: room.gameState,
+              })
+            );
+            return;
+          }
+
+          ws.send(
+            JSON.stringify({
+              type: "RESEND_SEQ",
+              roomCode: room.code,
+              packets: foundPackets,
+            })
+          );
           return;
         }
 
+        // 11. LEAVE_ROOM / leave_lobby
         if (type === "LEAVE_ROOM" || type === "leave_lobby") {
-          const targetCode = data.roomCode || currentRoomCode;
-          const targetPlayerId = data.playerId || currentPlayerId;
+          const session = getWsSession(ws);
+          const targetCode = (data.roomCode || session.roomCode || "").toUpperCase();
+          const targetPlayerId = data.playerId || session.playerId;
           if (targetCode && targetPlayerId) {
-            const room = rooms.get(targetCode.toUpperCase());
+            const room = rooms.get(targetCode);
             if (room) {
               if (!room.gameStarted) {
                 room.players = room.players.filter((p) => p.id !== targetPlayerId);
-                if (room.players.length === 0) rooms.delete(targetCode.toUpperCase());
-                else {
+                if (room.players.length === 0) {
+                  rooms.delete(targetCode);
+                } else {
                   if (room.hostId === targetPlayerId) {
                     room.hostId = room.players[0].id;
                     room.players[0].isCreator = true;
                   }
-                  broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: getSanitizedRoom(room) });
+                  const sanitized = getSanitizedRoom(room);
+                  broadcastToRoom(room, {
+                    type: "ROOM_UPDATED",
+                    room: sanitized,
+                  });
                 }
               } else {
-                handlePlayerDisconnectOrForfeit(io, room, targetPlayerId, true);
+                handlePlayerDisconnectOrForfeit(room, targetPlayerId, true);
               }
             }
           }
-          currentRoomCode = null;
-          currentPlayerId = null;
+          setWsSession(ws, null, session.playerId);
           return;
         }
       } catch (err) {
-        console.error("[Socket.io] Message processing error:", err);
+        console.error("[WS] Message processing error:", err);
       }
     });
 
-    socket.on("disconnect", () => {
-      activeQueue = activeQueue.filter((qp) => qp.socketId !== socket.id);
-      stopMatchmakingTimerIfEmpty(io);
-      broadcastQueueUpdate(io);
+    ws.on("close", () => {
+      // 1. Remove from global auto matchmaking queue if present
+      const wasInQueue = activeQueue.some((qp) => qp.ws === ws);
+      if (wasInQueue) {
+        activeQueue = activeQueue.filter((qp) => qp.ws !== ws);
+        stopMatchmakingTimerIfEmpty();
+        broadcastQueueUpdate();
+      }
 
-      if (currentRoomCode && currentPlayerId) {
-        const room = rooms.get(currentRoomCode);
+      // 2. Room handling on disconnect using WeakMap session (works for auto-match too)
+      const session = getWsSession(ws);
+      if (session.roomCode && session.playerId) {
+        const room = rooms.get(session.roomCode);
         if (room) {
+          const targetPlayer = room.players.find((p) => p.id === session.playerId);
+          // Guard against stale-socket close after rapid reconnect: only handle if this ws is still the player's active socket
+          if (targetPlayer && targetPlayer.ws && targetPlayer.ws !== ws) {
+            return;
+          }
+
           if (!room.gameStarted) {
-            room.players = room.players.filter((p) => p.id !== currentPlayerId);
-            if (room.players.length === 0) rooms.delete(currentRoomCode);
-            else {
-              if (room.hostId === currentPlayerId) {
+            room.players = room.players.filter((p) => p.id !== session.playerId);
+            if (room.players.length === 0) {
+              rooms.delete(session.roomCode);
+            } else {
+              if (room.hostId === session.playerId) {
                 room.hostId = room.players[0].id;
                 room.players[0].isCreator = true;
               }
-              broadcastToRoom(io, room, { type: "ROOM_UPDATED", room: getSanitizedRoom(room) });
+              const sanitized = getSanitizedRoom(room);
+              broadcastToRoom(room, {
+                type: "ROOM_UPDATED",
+                room: sanitized,
+              });
             }
           } else {
-            // 30-second grace period before marking player permanently forfeit
-            const p = room.players.find((player) => player.id === currentPlayerId);
-            if (p) {
-              p.isOffline = true;
-              const sanitized = getSanitizedRoom(room);
-              broadcastToRoom(io, room, { type: "PLAYER_OFFLINE", playerId: p.id, color: p.color, name: p.name, room: sanitized });
-
-              const timer = setTimeout(() => {
-                if (rooms.has(currentRoomCode!)) {
-                  handlePlayerDisconnectOrForfeit(io, room, currentPlayerId!, true);
-                }
-              }, 30000);
-              room.disconnectTimers.set(currentPlayerId, timer);
-            }
+            handlePlayerDisconnectOrForfeit(room, session.playerId, false);
           }
         }
       }
     });
   });
 
+  // Serve public assets (l.jpg, logo.svg, etc.) directly
+  const publicPath = path.join(process.cwd(), "public");
+  app.use(express.static(publicPath));
+
+  // Client Static Files / Vite Dev fallback (keeps preview working)
+  if (process.env.NODE_ENV !== "production") {
+    try {
+      const { createServer: createViteServer } = await import("vite");
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+    } catch {
+      // Ignored if Vite is not present on Render standalone production build
+    }
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (_req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
   server.listen(PORT, "0.0.0.0", () => {
-    console.log(`[Ludo Standalone Server] Running on http://0.0.0.0:${PORT}`);
+    console.log(`[SERVER] Standalone Ludo Server listening on port ${PORT}`);
   });
 }
 
-startServer().catch((err) => {
-  console.error("[Ludo Server Init Error]:", err);
-});
+startServer();
